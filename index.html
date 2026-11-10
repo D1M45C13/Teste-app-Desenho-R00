@@ -1,0 +1,753 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Traçar AR</title>
+<style>
+  :root {
+    --bg: #faf7f2; --ink: #1d1b19; --muted: #6b655e; --line: #e4ddd2;
+    --accent: #d2552b; --accent-ink: #fff; --ok: #2f8a4c; --card: #fff;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  button, select { font: inherit; }
+  .hidden { display: none !important; }
+
+  /* ---------- Setup ---------- */
+  #setup { max-width: 560px; margin: 0 auto;
+    padding: calc(env(safe-area-inset-top) + 20px) 18px calc(env(safe-area-inset-bottom) + 28px); }
+  h1 { font-size: 28px; margin: 4px 0 2px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin: 0 0 20px; line-height: 1.45; }
+  .step { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px; margin-bottom: 14px; }
+  .step h2 { font-size: 17px; margin: 0 0 8px; display: flex; align-items: center; gap: 10px; }
+  .num { width: 26px; height: 26px; border-radius: 50%; background: var(--ink); color: #fff;
+    display: inline-grid; place-items: center; font-size: 14px; flex: none; }
+  .step.done .num { background: var(--ok); }
+  .step p, .step li { color: var(--muted); font-size: 14.5px; line-height: 1.5; margin: 0 0 8px; }
+  .step ul { padding-left: 18px; margin: 0 0 10px; }
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; border: 0; border-radius: 12px;
+    padding: 12px 16px; background: var(--ink); color: #fff; font-weight: 600; font-size: 15px; cursor: pointer; width: 100%; }
+  .btn.secondary { background: #efe9df; color: var(--ink); }
+  .btn.primary { background: var(--accent); color: var(--accent-ink); font-size: 17px; padding: 15px; }
+  .btn:disabled { opacity: .4; }
+  .preview { margin-top: 12px; display: flex; gap: 12px; align-items: center; }
+  .preview img { width: 84px; height: 84px; object-fit: contain; border-radius: 10px; border: 1px solid var(--line);
+    background: repeating-conic-gradient(#eee 0 25%, #fff 0 50%) 0 0/16px 16px; }
+  .preview .info { font-size: 14px; color: var(--muted); }
+  label.check { display: flex; align-items: center; gap: 10px; font-size: 15px; margin-top: 12px; color: var(--ink); }
+  label.check input { width: 20px; height: 20px; accent-color: var(--accent); }
+  .field { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 6px; font-size: 15px; }
+  .field span { flex: none; }
+  .field select { flex: 1; min-width: 0; padding: 9px 10px; border-radius: 10px; border: 1px solid var(--line); background: #fff; color: var(--ink); }
+  .demo { display: block; width: 100%; max-width: 260px; margin: 6px auto 12px; }
+  .note { font-size: 13px; color: var(--muted); text-align: center; margin-top: 12px; line-height: 1.45; }
+
+  /* ---------- AR ---------- */
+  #ar { position: fixed; inset: 0; background: #000; overflow: hidden; touch-action: none; }
+  #video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #stage { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+  #overlay { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; display: none; }
+  #outline { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #outline polygon { fill: none; stroke: #4cd17a; stroke-width: 2; stroke-dasharray: 6 5; opacity: .85; }
+  #outline.holding polygon { stroke: #f2b33d; }
+  .topbar { position: absolute; left: 0; right: 0; top: 0; z-index: 20; display: flex; justify-content: space-between;
+    align-items: center; gap: 8px; padding: calc(env(safe-area-inset-top) + 10px) 12px 10px; pointer-events: none; }
+  .topbar > * { pointer-events: auto; }
+  .pill { background: rgba(0,0,0,.6); color: #fff; border-radius: 99px; padding: 8px 14px; font-size: 14px; font-weight: 600;
+    display: inline-flex; align-items: center; gap: 8px; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border: 0; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #f2b33d; flex: none; }
+  .pill.found .dot { background: #4cd17a; }
+  .pill.frozen .dot { background: #6aa8ff; }
+  .pill.bad .dot { background: #ff5a4f; }
+  .panel { position: absolute; left: 0; right: 0; bottom: 0; z-index: 20; background: rgba(20,18,16,.82);
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); color: #fff;
+    padding: 12px 16px calc(env(safe-area-inset-bottom) + 12px); border-radius: 18px 18px 0 0; }
+  .panel .grid { display: grid; grid-template-columns: 82px 1fr 46px; gap: 4px 10px; align-items: center; font-size: 13px; }
+  .panel .grid span.v { text-align: right; color: #cfc8bf; font-variant-numeric: tabular-nums; }
+  .panel input[type=range] { width: 100%; accent-color: var(--accent); height: 28px; }
+  .panel .actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; }
+  .panel .actions button { background: rgba(255,255,255,.14); color: #fff; border: 0; border-radius: 10px;
+    padding: 10px 4px; font-size: 13px; font-weight: 600; }
+  .panel .actions button.on { background: #3d7ff0; }
+  .hint { position: absolute; left: 50%; top: 42%; transform: translate(-50%,-50%); z-index: 15; color: #fff;
+    background: rgba(0,0,0,.6); padding: 14px 18px; border-radius: 14px; text-align: center; font-size: 15px;
+    line-height: 1.45; max-width: 84%; pointer-events: none; }
+  #loading { position: absolute; inset: 0; z-index: 30; display: grid; place-items: center; color: #fff; background: #000; font-size: 15px; }
+</style>
+</head>
+<body>
+
+<!-- ================= SETUP ================= -->
+<section id="setup">
+  <h1>Traçar AR</h1>
+  <p class="sub">Projete uma imagem na folha pela câmera e trace por cima. O app reconhece a própria folha, então a imagem continua no lugar mesmo se o celular se mexer. Não precisa de marcador.</p>
+
+  <div id="resumeBox" class="step hidden">
+    <h2>Continuar de onde parou</h2>
+    <p>Sua imagem e a última posição estão salvas neste aparelho.</p>
+    <button class="btn primary" id="resumeBtn">Continuar traçando</button>
+  </div>
+
+  <div class="step done" id="step1">
+    <h2><span class="num">1</span> Prepare a folha</h2>
+    <svg class="demo" viewBox="0 0 260 150" aria-hidden="true">
+      <rect x="0" y="0" width="260" height="150" rx="12" fill="#3b2f27"/>
+      <rect x="10" y="8" width="240" height="134" rx="10" fill="none" stroke="#ffffff22"/>
+      <polygon points="80,22 192,28 206,128 62,124" fill="#fbfaf7"/>
+      <g fill="#4cd17a"><circle cx="80" cy="22" r="4"/><circle cx="192" cy="28" r="4"/><circle cx="206" cy="128" r="4"/><circle cx="62" cy="124" r="4"/></g>
+      <text x="130" y="80" text-anchor="middle" font-size="11" fill="#9a928a" font-family="sans-serif">folha branca</text>
+      <text x="130" y="145" text-anchor="middle" font-size="9.5" fill="#c9bfb4" font-family="sans-serif">fundo escuro · os 4 cantos aparecendo</text>
+    </svg>
+    <ul>
+      <li>Use uma folha branca sobre uma superfície <b>escura</b>, como uma mesa de madeira escura, um pano ou uma cartolina preta. Em mesa branca, o app não consegue separar a folha do fundo.</li>
+      <li>Deixe os <b>4 cantos da folha</b> aparecendo na câmera.</li>
+      <li>Use luz boa e uniforme, sem sombra forte em cima da folha.</li>
+    </ul>
+    <div class="field">
+      <span>Folha</span>
+      <select id="paperSel">
+        <option value="1.4142">A4 / A3 / A5</option>
+        <option value="1.2941">Carta</option>
+        <option value="1.6471">Ofício</option>
+        <option value="1">Quadrada</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="step" id="step2">
+    <h2><span class="num">2</span> Escolha a imagem</h2>
+    <p>A foto ou o desenho que você quer traçar.</p>
+    <input type="file" id="imageInput" accept="image/*" class="hidden">
+    <button class="btn" id="imageBtn">🖼️ Escolher imagem</button>
+    <label class="check"><input type="checkbox" id="lineArt"> Converter em contorno (só as linhas)</label>
+    <div class="preview hidden" id="imagePreview">
+      <img id="imageImg" alt="Imagem">
+      <div class="info" id="imageInfo"></div>
+    </div>
+  </div>
+
+  <div class="step" id="step3">
+    <h2><span class="num">3</span> Posicione e trace</h2>
+    <p>Apoie o celular num copo ou suporte, de 25 a 40 cm acima da folha. A imagem aparece dentro da folha. Ajuste tamanho e posição pelos controles; tudo fica salvo neste aparelho.</p>
+    <button class="btn primary" id="startBtn" disabled>Abrir câmera</button>
+  </div>
+
+  <p class="note">Tudo fica no seu celular: as imagens não são enviadas para nenhum servidor.<br>No iPhone, abra pelo Safari.</p>
+</section>
+
+<!-- ================= AR ================= -->
+<section id="ar" class="hidden">
+  <video id="video" playsinline muted autoplay></video>
+  <div id="stage">
+    <img id="overlay" alt="">
+    <svg id="outline"><polygon points=""/></svg>
+  </div>
+  <div id="loading">Abrindo câmera…</div>
+  <div class="topbar">
+    <button class="pill" id="backBtn">‹ Voltar</button>
+    <span class="pill" id="status"><span class="dot"></span><span id="statusText">Procurando a folha…</span></span>
+  </div>
+  <div class="hint" id="hint">Aponte para a folha inteira, sobre um fundo escuro</div>
+  <div class="panel" id="panel">
+    <div class="grid" id="sliders"></div>
+    <div class="actions">
+      <button id="hideBtn">Esconder</button>
+      <button id="resetBtn">Centralizar</button>
+      <button id="refindBtn">Achar folha</button>
+      <button id="freezeBtn">📌 Fixar</button>
+    </div>
+  </div>
+  <button class="pill hidden" id="showBtn" style="position:absolute;right:12px;bottom:calc(env(safe-area-inset-bottom) + 14px);z-index:20">Ajustes</button>
+</section>
+
+<script>
+// ===== Paper detector: finds the 4 corners of a bright sheet on a darker surface =====
+// Input: grayscale Uint8Array (w*h). Returns {quad:[[x,y]x4] (clockwise from top-left), area} or null.
+const PaperDetect = (() => {
+  function otsu(g) { // → {t, gap}: threshold and the brightness gap between the two classes
+    const hist = new Float64Array(256);
+    for (let i = 0; i < g.length; i++) hist[g[i]]++;
+    const total = g.length; let sum = 0;
+    for (let i = 0; i < 256; i++) sum += i * hist[i];
+    let sumB = 0, wB = 0, best = 0, t = 127, gap = 0;
+    for (let i = 0; i < 256; i++) {
+      wB += hist[i]; if (!wB) continue;
+      const wF = total - wB; if (!wF) break;
+      sumB += i * hist[i];
+      const mB = sumB / wB, mF = (sum - sumB) / wF;
+      const v = wB * wF * (mB - mF) * (mB - mF);
+      if (v > best) { best = v; t = i; gap = mF - mB; }
+    }
+    return { t, gap };
+  }
+
+  function blur3(src, w, h) {
+    const out = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      let s = 0, n = 0;
+      for (let dy = -1; dy <= 1; dy++) { const yy = y + dy; if (yy < 0 || yy >= h) continue;
+        for (let dx = -1; dx <= 1; dx++) { const xx = x + dx; if (xx < 0 || xx >= w) continue; s += src[yy * w + xx]; n++; } }
+      out[y * w + x] = s / n;
+    }
+    return out;
+  }
+
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  function hull(pts) {
+    pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const lo = [], up = [];
+    for (const p of pts) { while (lo.length >= 2 && cross(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+    for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i];
+      while (up.length >= 2 && cross(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+    up.pop(); lo.pop(); return lo.concat(up);
+  }
+  function polyArea(p) { let a = 0; for (let i = 0; i < p.length; i++) { const q = p[(i + 1) % p.length]; a += p[i][0] * q[1] - q[0] * p[i][1]; } return Math.abs(a) / 2; }
+
+  // Remove hull vertices that barely change the shape, until <= maxN remain
+  function simplify(h, maxN) {
+    const p = h.slice();
+    while (p.length > maxN) {
+      let bi = 0, bv = Infinity;
+      for (let i = 0; i < p.length; i++) {
+        const a = p[(i - 1 + p.length) % p.length], b = p[i], c = p[(i + 1) % p.length];
+        const v = Math.abs(cross(a, b, c));
+        if (v < bv) { bv = v; bi = i; }
+      }
+      p.splice(bi, 1);
+    }
+    return p;
+  }
+
+  function maxQuad(p) {
+    const n = p.length; let best = -1, bq = null;
+    for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) for (let k = j + 1; k < n; k++) for (let l = k + 1; l < n; l++) {
+      const a = polyArea([p[i], p[j], p[k], p[l]]);
+      if (a > best) { best = a; bq = [p[i], p[j], p[k], p[l]]; }
+    }
+    return bq;
+  }
+
+  function pointInPoly(x, y, poly) {
+    let inside = false;
+    for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+      const xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+      if (((yi > y) !== (yj > y)) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+    }
+    return inside;
+  }
+
+  function fitLine(pts) { // PCA → {cx, cy, dx, dy}
+    let cx = 0, cy = 0; for (const p of pts) { cx += p[0]; cy += p[1]; } cx /= pts.length; cy /= pts.length;
+    let sxx = 0, syy = 0, sxy = 0;
+    for (const p of pts) { const dx = p[0] - cx, dy = p[1] - cy; sxx += dx * dx; syy += dy * dy; sxy += dx * dy; }
+    const ang = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+    return { cx, cy, dx: Math.cos(ang), dy: Math.sin(ang) };
+  }
+  function intersect(L1, L2) {
+    const det = L1.dx * L2.dy - L1.dy * L2.dx; if (Math.abs(det) < 1e-6) return null;
+    const t = ((L2.cx - L1.cx) * L2.dy - (L2.cy - L1.cy) * L2.dx) / det;
+    return [L1.cx + t * L1.dx, L1.cy + t * L1.dy];
+  }
+
+  function orderCW(q) { // clockwise on screen (y down), starting at top-left
+    const cx = (q[0][0] + q[1][0] + q[2][0] + q[3][0]) / 4, cy = (q[0][1] + q[1][1] + q[2][1] + q[3][1]) / 4;
+    const s = q.slice().sort((a, b) => Math.atan2(a[1] - cy, a[0] - cx) - Math.atan2(b[1] - cy, b[0] - cx));
+    let start = 0, bv = Infinity;
+    s.forEach((p, i) => { const v = p[0] + p[1]; if (v < bv) { bv = v; start = i; } });
+    return [0, 1, 2, 3].map(i => s[(start + i) % 4]);
+  }
+
+  // Binary box max/min filter (separable) of radius r. dilate=true → max, else min.
+  function morph(src, w, h, r, dilate) {
+    const tmp = new Uint8Array(w * h), out = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) {
+      let cnt = 0; const row = y * w;
+      for (let x = 0; x <= Math.min(r, w - 1); x++) cnt += src[row + x];
+      for (let x = 0; x < w; x++) {
+        const lo = x - r, hi = x + r, span = Math.min(hi, w - 1) - Math.max(lo, 0) + 1;
+        tmp[row + x] = dilate ? (cnt > 0 ? 1 : 0) : (cnt === span ? 1 : 0);
+        if (hi + 1 < w) cnt += src[row + hi + 1];
+        if (lo >= 0) cnt -= src[row + lo];
+      }
+    }
+    for (let x = 0; x < w; x++) {
+      let cnt = 0;
+      for (let y = 0; y <= Math.min(r, h - 1); y++) cnt += tmp[y * w + x];
+      for (let y = 0; y < h; y++) {
+        const lo = y - r, hi = y + r, span = Math.min(hi, h - 1) - Math.max(lo, 0) + 1;
+        out[y * w + x] = dilate ? (cnt > 0 ? 1 : 0) : (cnt === span ? 1 : 0);
+        if (hi + 1 < h) cnt += tmp[(hi + 1) * w + x];
+        if (lo >= 0) cnt -= tmp[lo * w + x];
+      }
+    }
+    return out;
+  }
+
+  // Main entry. prevQuad (optional) helps keep the same sheet when a hand splits it.
+  function detect(grayIn, w, h, prevQuad) {
+    const gb = blur3(grayIn, w, h);
+    const ot = otsu(gb);
+    if (ot.gap < 45) return { reason: 'contrast' };    // sheet and surface too similar
+    const t0 = Math.max(ot.t, 60);
+    const N = w * h;
+    // Binary mask, then closing to erase pencil/pen strokes drawn on the sheet
+    let m = new Uint8Array(N); for (let i = 0; i < N; i++) m[i] = gb[i] > t0 ? 1 : 0;
+    const r = Math.max(2, Math.round(Math.min(w, h) / 80));
+    m = morph(morph(m, w, h, r, true), w, h, r, false);
+    const g = m, t = 0;
+    const lab = new Int32Array(N).fill(-1);
+    const comps = [];
+    const stack = new Int32Array(N);
+    for (let i = 0; i < N; i++) {
+      if (lab[i] !== -1 || g[i] <= t) continue;
+      const id = comps.length; let sp = 0, size = 0, sx = 0, sy = 0;
+      stack[sp++] = i; lab[i] = id;
+      while (sp) {
+        const p = stack[--sp]; size++; const x = p % w, y = (p / w) | 0; sx += x; sy += y;
+        if (x > 0 && lab[p - 1] === -1 && g[p - 1] > t) { lab[p - 1] = id; stack[sp++] = p - 1; }
+        if (x < w - 1 && lab[p + 1] === -1 && g[p + 1] > t) { lab[p + 1] = id; stack[sp++] = p + 1; }
+        if (y > 0 && lab[p - w] === -1 && g[p - w] > t) { lab[p - w] = id; stack[sp++] = p - w; }
+        if (y < h - 1 && lab[p + w] === -1 && g[p + w] > t) { lab[p + w] = id; stack[sp++] = p + w; }
+      }
+      comps.push({ size, cx: sx / size, cy: sy / size });
+    }
+    if (!comps.length) return null;
+
+    // Choose which bright regions form the sheet
+    const sel = new Uint8Array(comps.length);
+    if (prevQuad) {
+      comps.forEach((c, i) => { if (c.size > N * 0.01 && pointInPoly(c.cx, c.cy, prevQuad)) sel[i] = 1; });
+    }
+    if (!sel.some(Boolean)) {
+      let bi = 0; comps.forEach((c, i) => { if (c.size > comps[bi].size) bi = i; }); sel[bi] = 1;
+    }
+
+    // Row extremes → convex hull
+    const pts = [];
+    for (let y = 0; y < h; y++) {
+      let L = -1, R = -1;
+      for (let x = 0; x < w; x++) { const l = lab[y * w + x]; if (l >= 0 && sel[l]) { if (L < 0) L = x; R = x; } }
+      if (L >= 0) { pts.push([L, y]); if (R !== L) pts.push([R, y]); }
+    }
+    if (pts.length < 8) return null;
+    const H = hull(pts);
+    if (H.length < 4) return null;
+    const hullArea = polyArea(H);
+    if (hullArea < N * 0.05) return null;
+    let quad = maxQuad(simplify(H, 16));
+    if (!quad) return null;
+    const qa = polyArea(quad);
+    if (qa / hullArea < 0.85) return null;           // not rectangular enough
+    quad = orderCW(quad);
+
+    // Refine each edge by fitting a line to the region's boundary pixels near that edge
+    const buckets = [[], [], [], []];
+    const isSel = p => { const l = lab[p]; return l >= 0 && sel[l] === 1; };
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+      const p = y * w + x; if (!isSel(p)) continue;
+      if (isSel(p - 1) && isSel(p + 1) && isSel(p - w) && isSel(p + w)) continue;
+      // nearest edge
+      let be = -1, bd = 2.5;
+      for (let e = 0; e < 4; e++) {
+        const a = quad[e], b = quad[(e + 1) % 4];
+        const ex = b[0] - a[0], ey = b[1] - a[1], len = Math.hypot(ex, ey);
+        const tt = ((x - a[0]) * ex + (y - a[1]) * ey) / (len * len);
+        if (tt < 0.12 || tt > 0.88) continue;           // skip near corners
+        const d = Math.abs((x - a[0]) * ey - (y - a[1]) * ex) / len;
+        if (d < bd) { bd = d; be = e; }
+      }
+      if (be >= 0) buckets[be].push([x + 0.5, y + 0.5]);
+    }
+    const lines = buckets.map((b, e) => {
+      if (b.length >= 8) return fitLine(b);
+      const a = quad[e], c = quad[(e + 1) % 4], len = Math.hypot(c[0] - a[0], c[1] - a[1]);
+      return { cx: a[0], cy: a[1], dx: (c[0] - a[0]) / len, dy: (c[1] - a[1]) / len };
+    });
+    const refined = [];
+    for (let i = 0; i < 4; i++) {
+      const p = intersect(lines[(i + 3) % 4], lines[i]);
+      if (!p || Math.hypot(p[0] - quad[i][0], p[1] - quad[i][1]) > Math.max(w, h) * 0.08) refined.push(quad[i]);
+      else refined.push(p);
+    }
+    // A corner touching the frame edge means the sheet is cut off: its true corner is unknown
+    const m2 = Math.max(2, w * 0.01);
+    for (const p of refined) if (p[0] < m2 || p[1] < m2 || p[0] > w - m2 || p[1] > h - m2) return { reason: 'edge' };
+    return { quad: refined, area: polyArea(refined) };
+  }
+
+  // Is quad q a plausible continuation of reference quad ref (both aligned)?
+  // Real camera motion moves all 4 corners together; a hand/arm covering a corner
+  // makes one or two corners jump while the rest stay put.
+  function consistent(q, ref, w) {
+    const d = q.map((p, i) => Math.hypot(p[0] - ref[i][0], p[1] - ref[i][1]));
+    const mx = Math.max(...d), mn = Math.min(...d), mean = (d[0] + d[1] + d[2] + d[3]) / 4;
+    const ar = polyArea(q) / polyArea(ref);
+    return (mx - mn) <= w * 0.02 + 0.6 * mean && ar > 0.8 && ar < 1.25;
+  }
+
+  // Re-order a new quad so it lines up with the previous one (handles phone rotation)
+  function align(q, prev) {
+    if (!prev) return q;
+    let best = q, bd = Infinity;
+    for (let r = 0; r < 4; r++) {
+      const c = [0, 1, 2, 3].map(i => q[(i + r) % 4]);
+      let d = 0; for (let i = 0; i < 4; i++) d += Math.hypot(c[i][0] - prev[i][0], c[i][1] - prev[i][1]);
+      if (d < bd) { bd = d; best = c; }
+    }
+    return best;
+  }
+
+  // Homography mapping src[i] → dst[i] (4 points each). Returns 3x3 row-major [a..i].
+  function homography(src, dst) {
+    const A = [], B = [];
+    for (let i = 0; i < 4; i++) {
+      const [x, y] = src[i], [u, v] = dst[i];
+      A.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); B.push(u);
+      A.push([0, 0, 0, x, y, 1, -v * x, -v * y]); B.push(v);
+    }
+    for (let c = 0; c < 8; c++) {
+      let piv = c; for (let r = c + 1; r < 8; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+      [A[c], A[piv]] = [A[piv], A[c]]; [B[c], B[piv]] = [B[piv], B[c]];
+      const d = A[c][c]; if (Math.abs(d) < 1e-12) return null;
+      for (let r = 0; r < 8; r++) if (r !== c) {
+        const f = A[r][c] / d; if (!f) continue;
+        for (let k = c; k < 8; k++) A[r][k] -= f * A[c][k]; B[r] -= f * B[c];
+      }
+    }
+    const hh = B.map((b, i) => b / A[i][i]);
+    return [hh[0], hh[1], hh[2], hh[3], hh[4], hh[5], hh[6], hh[7], 1];
+  }
+
+  // Shape signature: normalised edge lengths + interior angles. A hand cutting a corner
+  // distorts it; moving the phone (a little) barely does.
+  function shapeSim(a, b) {
+    const sig = q => {
+      const L = [0, 1, 2, 3].map(i => Math.hypot(q[(i + 1) % 4][0] - q[i][0], q[(i + 1) % 4][1] - q[i][1]));
+      const P = L[0] + L[1] + L[2] + L[3];
+      const A = [0, 1, 2, 3].map(i => {
+        const p = q[i], n = q[(i + 1) % 4], pr = q[(i + 3) % 4];
+        return Math.atan2(n[1] - p[1], n[0] - p[0]) - Math.atan2(pr[1] - p[1], pr[0] - p[0]);
+      }).map(x => { x = Math.abs(x) % (2 * Math.PI); return x > Math.PI ? 2 * Math.PI - x : x; });
+      return { L: L.map(l => l / P), A };
+    };
+    const sa = sig(a), sb = sig(b);
+    for (let i = 0; i < 4; i++) {
+      if (Math.abs(sa.L[i] - sb.L[i]) > 0.025) return false;
+      if (Math.abs(sa.A[i] - sb.A[i]) > 0.14) return false;   // ~8°
+    }
+    return true;
+  }
+
+  // Stateful tracker. update(detectResult) → { quad (or null), status }
+  // status: 'searching' | 'found' | 'holding' | 'edge' | 'contrast'
+  function createTracker(w) {
+    let ref = null, cand = null, candN = 0;
+    const NEED_START = 3, NEED_JUMP = 8;
+    return {
+      reset() { ref = null; cand = null; candN = 0; },
+      get quad() { return ref; },
+      update(res) {
+        if (!res || !res.quad) {
+          const st = ref ? 'holding' : (res && res.reason) || 'searching';
+          return { quad: ref, status: ref ? 'holding' : st, reason: res && res.reason };
+        }
+        const q = align(res.quad, ref || cand);
+        if (ref && consistent(q, ref, w)) { ref = q; cand = null; candN = 0; return { quad: ref, status: 'found' }; }
+        // Not a smooth continuation: build up a candidate before believing it
+        if (cand && consistent(q, cand, w)) candN++; else candN = 1;
+        cand = q;
+        const need = ref ? NEED_JUMP : NEED_START;
+        if (candN >= need && (!ref || shapeSim(cand, ref))) { ref = cand; cand = null; candN = 0; return { quad: ref, status: 'found' }; }
+        return { quad: ref, status: ref ? 'holding' : 'searching' };
+      },
+    };
+  }
+
+  return { detect, align, consistent, shapeSim, createTracker, homography, polyArea, orderCW };
+})();
+if (typeof module !== 'undefined') module.exports = PaperDetect;
+
+</script>
+<script>
+(() => {
+const $ = id => document.getElementById(id);
+
+/* ---------- Storage ---------- */
+const DB_NAME = 'tracar-ar', STORE = 'kv';
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open(DB_NAME, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore(STORE);
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+  });
+}
+async function put(key, val) {
+  try { const db = await idb(); await new Promise((res, rej) => {
+    const tx = db.transaction(STORE, 'readwrite'); tx.objectStore(STORE).put(val, key);
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error); }); } catch (e) { console.warn(e); }
+}
+async function get(key) {
+  try { const db = await idb(); return await new Promise((res, rej) => {
+    const r = db.transaction(STORE).objectStore(STORE).get(key);
+    r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); } catch (e) { return undefined; }
+}
+const SKEY = 'tracar-paper-settings';
+const DEFAULTS = { x: 0, y: 0, scale: 0.85, rot: 0, opacity: 0.55, smooth: 0.5, paper: '1.4142' };
+function loadSettings() { try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(SKEY) || '{}') }; } catch { return { ...DEFAULTS }; } }
+function saveSettings() { try { localStorage.setItem(SKEY, JSON.stringify(settings)); } catch {} }
+let settings = loadSettings();
+$('paperSel').value = settings.paper;
+$('paperSel').onchange = () => { settings.paper = $('paperSel').value; saveSettings(); };
+const paperRatio = () => parseFloat(settings.paper);
+
+/* ---------- Image ---------- */
+const state = { imageURL: null, imageAspect: 1 };
+function loadImg(src) { return new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = src; }); }
+async function normalize(file, maxSide) {
+  const url = URL.createObjectURL(file);
+  const img = await loadImg(url);
+  const k = Math.min(1, maxSide / Math.max(img.naturalWidth, img.naturalHeight));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.naturalWidth * k); c.height = Math.round(img.naturalHeight * k);
+  c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+  URL.revokeObjectURL(url);
+  return c.toDataURL('image/png');
+}
+async function toLineArt(dataURL) {
+  const img = await loadImg(dataURL);
+  const w = img.naturalWidth, h = img.naturalHeight;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+  ctx.filter = 'blur(1px)'; ctx.drawImage(img, 0, 0); ctx.filter = 'none';
+  const src = ctx.getImageData(0, 0, w, h).data;
+  const g = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) g[i] = 0.299 * src[i*4] + 0.587 * src[i*4+1] + 0.114 * src[i*4+2];
+  const out = ctx.createImageData(w, h); const d = out.data;
+  const mags = new Float32Array(w * h); let max = 1;
+  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+    const i = y * w + x;
+    const gx = -g[i-w-1] - 2*g[i-1] - g[i+w-1] + g[i-w+1] + 2*g[i+1] + g[i+w+1];
+    const gy = -g[i-w-1] - 2*g[i-w] - g[i-w+1] + g[i+w-1] + 2*g[i+w] + g[i+w+1];
+    const m = Math.hypot(gx, gy); mags[i] = m; if (m > max) max = m;
+  }
+  const t = max * 0.12;
+  for (let i = 0; i < w * h; i++) {
+    const a = Math.max(0, Math.min(1, (mags[i] - t) / (max * 0.25)));
+    d[i*4] = 15; d[i*4+1] = 15; d[i*4+2] = 15; d[i*4+3] = Math.round(a * 255);
+  }
+  ctx.putImageData(out, 0, 0);
+  return c.toDataURL('image/png');
+}
+let rawImageURL = null;
+$('imageBtn').onclick = () => $('imageInput').click();
+$('imageInput').onchange = async e => {
+  const file = e.target.files[0]; if (!file) return;
+  e.target.value = '';
+  rawImageURL = await normalize(file, 1600);
+  await applyImage();
+};
+$('lineArt').onchange = () => { if (rawImageURL) applyImage(); };
+async function applyImage() {
+  $('imageInfo').textContent = 'Processando…';
+  $('imagePreview').classList.remove('hidden');
+  const url = $('lineArt').checked ? await toLineArt(rawImageURL) : rawImageURL;
+  const img = await loadImg(url);
+  state.imageURL = url; state.imageAspect = img.naturalHeight / img.naturalWidth;
+  $('imageImg').src = url;
+  $('imageInfo').textContent = '✅ Imagem pronta.';
+  $('step2').classList.add('done');
+  await put('image', { url, raw: rawImageURL, lineArt: $('lineArt').checked });
+  $('startBtn').disabled = false;
+}
+(async () => {
+  const im = await get('image');
+  if (im?.url) {
+    state.imageURL = im.url; rawImageURL = im.raw || im.url; $('lineArt').checked = !!im.lineArt;
+    const img = await loadImg(im.url); state.imageAspect = img.naturalHeight / img.naturalWidth;
+    $('imageImg').src = im.url; $('imagePreview').classList.remove('hidden');
+    $('imageInfo').textContent = '✅ Imagem salva.'; $('step2').classList.add('done');
+    $('startBtn').disabled = false; $('resumeBox').classList.remove('hidden');
+  }
+})();
+
+/* ---------- Controls ---------- */
+const SLIDERS = [
+  { key: 'opacity', label: 'Transparência', min: 0.05, max: 1, step: 0.01, fmt: v => Math.round(v * 100) + '%' },
+  { key: 'scale', label: 'Tamanho', min: 0.1, max: 2.5, step: 0.01, fmt: v => Math.round(v * 100) + '%' },
+  { key: 'x', label: '↔ Lado', min: -1, max: 1, step: 0.005, fmt: v => (v * 100).toFixed(0) },
+  { key: 'y', label: '↕ Altura', min: -1, max: 1, step: 0.005, fmt: v => (v * 100).toFixed(0) },
+  { key: 'rot', label: 'Girar', min: -180, max: 180, step: 1, fmt: v => Math.round(v) + '°' },
+  { key: 'smooth', label: 'Firmeza', min: 0, max: 0.92, step: 0.01, fmt: v => v < 0.3 ? 'rápida' : v < 0.7 ? 'média' : 'firme' },
+];
+function buildSliders() {
+  const g = $('sliders'); g.innerHTML = '';
+  for (const s of SLIDERS) {
+    const lab = document.createElement('span'); lab.textContent = s.label;
+    const inp = document.createElement('input'); inp.type = 'range';
+    Object.assign(inp, { min: s.min, max: s.max, step: s.step, value: settings[s.key] });
+    const val = document.createElement('span'); val.className = 'v'; val.textContent = s.fmt(settings[s.key]);
+    inp.oninput = () => { settings[s.key] = parseFloat(inp.value); val.textContent = s.fmt(settings[s.key]); saveSettings(); };
+    inp.dataset.key = s.key;
+    g.append(lab, inp, val);
+  }
+}
+$('hideBtn').onclick = () => { $('panel').classList.add('hidden'); $('showBtn').classList.remove('hidden'); };
+$('showBtn').onclick = () => { $('panel').classList.remove('hidden'); $('showBtn').classList.add('hidden'); };
+$('resetBtn').onclick = () => { Object.assign(settings, { x: 0, y: 0, rot: 0 }); saveSettings(); buildSliders(); };
+
+/* ---------- AR loop ---------- */
+const PD = PaperDetect;
+const PROC_W = 320;
+let stream = null, running = false, tracker = null, frozen = false;
+let sm = null;                // smoothed screen-space corners
+let orient = null;            // 'portrait' | 'landscape' (decided when the sheet is first found)
+let lastDetect = 0, lastFrame = 0, lastStatus = '';
+const proc = document.createElement('canvas');
+const pctx = proc.getContext('2d', { willReadFrequently: true });
+let gray = null;
+
+function setFrozen(v) {
+  frozen = v;
+  $('freezeBtn').classList.toggle('on', v);
+  $('freezeBtn').textContent = v ? '📌 Fixado' : '📌 Fixar';
+}
+$('freezeBtn').onclick = () => setFrozen(!frozen);
+$('refindBtn').onclick = () => { tracker?.reset(); sm = null; orient = null; setFrozen(false); };
+
+const STATUS = {
+  searching: ['Procurando a folha…', ''],
+  found: ['Folha encontrada', 'found'],
+  holding: ['Mantendo a posição', ''],
+  edge: ['Mostre os 4 cantos da folha', 'bad'],
+  contrast: ['Coloque a folha sobre um fundo escuro', 'bad'],
+  frozen: ['Fixado: pode mexer à vontade na folha', 'frozen'],
+};
+function showStatus(s) {
+  if (s === lastStatus) return; lastStatus = s;
+  const [txt, cls] = STATUS[s] || STATUS.searching;
+  $('statusText').textContent = txt;
+  $('status').className = 'pill' + (cls ? ' ' + cls : '');
+  $('outline').classList.toggle('holding', s === 'holding');
+}
+
+async function startAR() {
+  $('setup').classList.add('hidden'); $('ar').classList.remove('hidden');
+  $('loading').classList.remove('hidden'); $('loading').textContent = 'Abrindo câmera…';
+  settings = loadSettings(); buildSliders(); setFrozen(false);
+  sm = null; orient = null; lastStatus = '';
+  const ov = $('overlay'); ov.src = state.imageURL; ov.style.display = 'none';
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+    });
+    const v = $('video'); v.srcObject = stream; await v.play();
+    await new Promise(r => v.videoWidth ? r() : v.addEventListener('loadedmetadata', r, { once: true }));
+    proc.width = PROC_W; proc.height = Math.round(PROC_W * v.videoHeight / v.videoWidth);
+    gray = new Uint8Array(proc.width * proc.height);
+    tracker = PD.createTracker(proc.width);
+    $('loading').classList.add('hidden');
+    running = true; lastFrame = performance.now();
+    requestAnimationFrame(loop);
+  } catch (err) {
+    console.error(err);
+    $('loading').innerHTML = '<div style="padding:24px;text-align:center;line-height:1.5">Não consegui abrir a câmera.<br>' +
+      'Confira se o site está em <b>https://</b>, se está no Safari e se a câmera foi permitida ' +
+      '(Ajustes › Safari › Câmera).<br><br><button class="btn secondary" onclick="location.reload()">Tentar de novo</button></div>';
+  }
+}
+function stopAR() {
+  running = false;
+  stream?.getTracks().forEach(t => t.stop()); stream = null;
+  $('video').srcObject = null;
+  $('ar').classList.add('hidden'); $('setup').classList.remove('hidden');
+}
+$('startBtn').onclick = startAR; $('resumeBtn').onclick = startAR; $('backBtn').onclick = stopAR;
+
+// processing-canvas coords → screen coords (video is shown with object-fit: cover)
+function toScreen(q) {
+  const v = $('video'), W = v.clientWidth, H = v.clientHeight;
+  const vw = v.videoWidth, vh = v.videoHeight;
+  const s = Math.max(W / vw, H / vh), ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
+  const f = vw / proc.width;
+  return q.map(([x, y]) => [x * f * s + ox, y * f * s + oy]);
+}
+
+function loop(now) {
+  if (!running) return;
+  const dt = Math.min(0.1, (now - lastFrame) / 1000); lastFrame = now;
+  const v = $('video');
+
+  if (!frozen && now - lastDetect > 30 && v.readyState >= 2) {
+    lastDetect = now;
+    pctx.drawImage(v, 0, 0, proc.width, proc.height);
+    const d = pctx.getImageData(0, 0, proc.width, proc.height).data;
+    for (let i = 0, j = 0; i < gray.length; i++, j += 4) gray[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
+    const res = PD.detect(gray, proc.width, proc.height, tracker.quad);
+    const out = tracker.update(res);
+    showStatus(out.status === 'holding' && res && res.reason ? res.reason : out.status);
+    if (out.quad) {
+      const target = toScreen(out.quad);
+      if (!sm) {
+        sm = target.map(p => p.slice());
+        // Decide portrait/landscape once: are the screen-horizontal edges (0-1, 2-3) the long ones?
+        const L = i => Math.hypot(target[(i + 1) % 4][0] - target[i][0], target[(i + 1) % 4][1] - target[i][1]);
+        orient = (L(0) + L(2)) > (L(1) + L(3)) ? 'landscape' : 'portrait';
+      } else {
+        // keep the same corner ordering as before
+        const al = PD.align(target, sm);
+        for (let i = 0; i < 4; i++) sm[i]._t = al[i];
+      }
+      if (sm[0]._t === undefined) sm.forEach((p, i) => p._t = target[i]);
+    }
+  } else if (frozen) showStatus('frozen');
+
+  // Ease the smoothed corners toward their latest targets
+  if (sm) {
+    const k = 1 - Math.pow(settings.smooth, dt * 30);
+    for (const p of sm) if (p._t) { p[0] += (p._t[0] - p[0]) * k; p[1] += (p._t[1] - p[1]) * k; }
+    render();
+  }
+  $('hint').classList.toggle('hidden', !!sm);
+  requestAnimationFrame(loop);
+}
+
+function render() {
+  const ov = $('overlay');
+  if (!ov.naturalWidth) return;
+  // Paper coordinates: width/height in "paper widths"
+  const r = paperRatio();
+  const PW = orient === 'landscape' ? r : 1, PH = orient === 'landscape' ? 1 : r;
+  const Hp = PD.homography([[0, 0], [PW, 0], [PW, PH], [0, PH]], sm.map(p => [p[0], p[1]]));
+  if (!Hp) return;
+  // Image element: iw × ih CSS px; place it in paper coords
+  const iw = 1000, ih = 1000 * state.imageAspect;
+  const base = Math.min(PW, PH);                     // 100% = the sheet's short side
+  const k = settings.scale * base / iw;
+  const a = -settings.rot * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
+  const Cx = PW / 2 + settings.x * base, Cy = PH / 2 - settings.y * base;
+  const A = [k * c, -k * s, Cx - k * c * iw / 2 + k * s * ih / 2,
+             k * s,  k * c, Cy - k * s * iw / 2 - k * c * ih / 2,
+             0, 0, 1];
+  const M = mul(Hp, A);
+  const n = M[8];
+  ov.style.width = iw + 'px'; ov.style.height = ih + 'px';
+  ov.style.opacity = settings.opacity;
+  ov.style.transform = `matrix3d(${M[0]/n},${M[3]/n},0,${M[6]/n},${M[1]/n},${M[4]/n},0,${M[7]/n},0,0,1,0,${M[2]/n},${M[5]/n},0,1)`;
+  ov.style.display = 'block';
+  $('outline').querySelector('polygon').setAttribute('points', frozen ? '' : sm.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' '));
+}
+function mul(A, B) {
+  const R = new Array(9);
+  for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+    R[i * 3 + j] = A[i * 3] * B[j] + A[i * 3 + 1] * B[3 + j] + A[i * 3 + 2] * B[6 + j];
+  return R;
+}
+})();
+</script>
+</body>
+</html>
