@@ -657,7 +657,7 @@ const FlowTrack = (() => {
     let count = 0, hasPrev = false;
     const kp = []; for (let i = 0; i < w * h; i++) kp.push(new J.keypoint_t(0, 0, 0, 0));
     const model = new J.matrix_t(3, 3, J.F32_t | J.C1_t);
-    const REFINE = opts && opts.refine !== undefined ? opts.refine : 0.25;
+    const REFINE = opts && opts.refine !== undefined ? opts.refine : 0.1;
     const params = new J.ransac_params_t(4, opts && opts.thresh || 2.5, 0.5, 0.995);
     const kernel = new J.motion_model.homography2d();
     const fromPts = [], toPts = [];
@@ -674,17 +674,19 @@ const FlowTrack = (() => {
         const base = currPyr.data[0];
         base.data.set(gray);
         currPyr.build(base, true);
-        let H = null, inl = 0, n = 0;
+        let H = null, inl = 0, n = 0, motion = null;
         if (hasPrev && count >= 8) {
           J.optical_flow_lk.track(prevPyr, currPyr, xy, nxy, count, WIN, 25, status, 0.01, 0.0008);
-          let k = 0;
+          let k = 0; const disp = [];
           for (let i = 0; i < count; i++) {
             if (!status[i]) continue;
             const x = nxy[i * 2], y = nxy[i * 2 + 1];
             if (x < 2 || y < 2 || x > w - 3 || y > h - 3) continue;
+            disp.push(Math.hypot(x - xy[i * 2], y - xy[i * 2 + 1]));
             xy[k * 2] = x; xy[k * 2 + 1] = y; pl[k * 2] = pl[i * 2]; pl[k * 2 + 1] = pl[i * 2 + 1]; k++;
           }
           count = k; n = k;
+          if (disp.length >= 8) { disp.sort((a, b) => a - b); motion = disp[disp.length >> 1]; }   // median: robust to a moving hand
           for (let i = 0; i < n; i++) { fromPts[i].x = pl[i * 2]; fromPts[i].y = pl[i * 2 + 1]; toPts[i].x = xy[i * 2]; toPts[i].y = xy[i * 2 + 1]; }
           if (n >= 10 && J.motion_estimator.ransac(params, kernel, fromPts, toPts, n, model, maskM, 500)) {
             const S = [], D = [];
@@ -710,7 +712,16 @@ const FlowTrack = (() => {
         } else count = 0;
         const t = prevPyr; prevPyr = currPyr; currPyr = t;   // this frame becomes "previous"
         hasPrev = true;
-        return { H, inliers: inl, tracked: n };
+        return { H, inliers: inl, tracked: n, motion };
+      },
+      // Nudge every point's surface position toward where an absolute pose (from the sheet's
+      // corners) says it is. Keeps the point map from slowly sliding over time.
+      anchor(Hs, rate) {
+        const Hi = inv(Hs); if (!Hi) return;
+        for (let i = 0; i < count; i++) {
+          const q = apply(Hi, [xy[i * 2], xy[i * 2 + 1]]);
+          pl[i * 2] += (q[0] - pl[i * 2]) * rate; pl[i * 2 + 1] += (q[1] - pl[i * 2 + 1]) * rate;
+        }
       },
       // 2) Add new points where needed, pinning them to the surface with the final pose
       //    (Hs: sheet coords → this frame's pixels).
@@ -740,33 +751,61 @@ const FlowTrack = (() => {
 if (typeof module !== 'undefined') module.exports = FlowTrack;
 
 // ===== Hybrid tracker: sheet corners (absolute, drift-free) + surface texture tracking (works close up)
+// Design goals: the sketch must never wander on its own.
+//  • Texture tracking drives the pose frame to frame (smooth, works close up).
+//  • The corner detector only CORRECTS it gently (no jumps), and re-anchors the point map.
+//  • When the camera isn't moving, the pose is frozen exactly (dead band).
 const Hybrid = (() => {
   const UNIT = [[0, 0], [1, 0], [1, 1], [0, 1]];       // sheet coordinates of the 4 corners
   function create(w, h, PD, FT, J) {
     PD = PD || PaperDetect; FT = FT || FlowTrack;
     const T = PD.createTracker(w, h), F = FT.create(w, h, J);
     const diag = Math.hypot(w, h);
-    let Q = null, disagree = 0;
+    const STILL = 0.25;        // px/frame (processing resolution) below which the camera counts as still
+    const O = (typeof process !== "undefined" && process.env && process.env.HYOPTS) ? JSON.parse(process.env.HYOPTS) : {};
+    // share of the corner-detector correction applied per frame: gentle when still (no shimmer),
+    // quicker when moving (no lag); same for re-anchoring the point map
+    const CORRECT_STILL = O.cs || 0.04, CORRECT_MOVING = O.cm || 0.15;
+    const ANCHOR_STILL = 0.03, ANCHOR_MOVING = 0.1;
+    let Q = null, disagree = 0, stillFrames = 0;
     const maxDist = (a, b) => Math.max(...a.map((p, i) => Math.hypot(p[0] - b[i][0], p[1] - b[i][1])));
+    const lerpQ = (a, b, t) => a.map((p, i) => [p[0] + (b[i][0] - p[0]) * t, p[1] + (b[i][1] - p[1]) * t]);
     return {
-      reset() { T.reset(); F.reset(); Q = null; disagree = 0; },
+      reset() { T.reset(); F.reset(); Q = null; disagree = 0; stillFrames = 0; },
       get quad() { return Q; },
       update(gray) {
         // 1) Texture points → where the sheet is now (corners may be far outside the frame)
         const fl = F.track(gray);
         const pred = (Q && fl.H) ? UNIT.map(p => FT.apply(fl.H, p)) : null;
+        const still = fl.motion !== null && fl.motion < STILL;
+        stillFrames = still ? stillFrames + 1 : 0;
         if (pred) T.setRef(pred);
-        // 2) Corner detection → absolute fix whenever the whole sheet is cleanly visible
+        // 2) Corner detection → absolute reference whenever the whole sheet is cleanly visible
         const res = PD.detect(gray, w, h, Q);
         const out = T.update(res);
+        const det = (out.status === 'found' && out.quad) ? PD.align(out.quad, pred || Q || out.quad) : null;
+
         let status, trusted = false;
-        if (out.status === 'found' && out.quad) {
-          const q = pred ? PD.align(out.quad, pred) : (Q ? PD.align(out.quad, Q) : out.quad);
-          if (!pred || maxDist(q, pred) < diag * 0.06) { Q = q; disagree = 0; status = 'found'; trusted = true; }
-          else if (++disagree > 8) { Q = q; disagree = 0; status = 'found'; trusted = true; F.reset(); }
-          else { Q = pred; status = 'tracking'; trusted = true; }
-        } else if (pred) {
-          Q = pred; status = 'tracking'; trusted = true; disagree = 0;
+        if (pred) {
+          let target = pred;
+          status = 'tracking'; trusted = true;
+          if (det) {
+            const d = maxDist(det, pred);
+            if (d < diag * 0.06) {
+              disagree = 0; status = 'found';
+              target = lerpQ(pred, det, still ? CORRECT_STILL : CORRECT_MOVING);                      // gentle correction, no jump
+              F.anchor(PD.homography(UNIT, det), still ? ANCHOR_STILL : ANCHOR_MOVING);                 // keep the point map honest
+            } else if (++disagree > 15) {                               // persistent: the map is wrong
+              target = det; disagree = 0; F.reset(); status = 'found';
+            }
+          } else disagree = 0;
+          // Dead band: camera not moving → don't move the sketch for tiny differences
+          if (Q && still && maxDist(target, Q) < Math.max(1.5, diag * 0.004)) target = Q;
+          Q = target;
+        } else if (det) {
+          // No texture lock (start, or after a reset): use the corners, smoothed if we had a pose
+          Q = (Q && maxDist(det, Q) < diag * 0.03) ? lerpQ(Q, det, 0.35) : det;
+          status = 'found'; trusted = true; disagree = 0;
         } else if (out.status === 'partial' && out.quad) {
           Q = out.quad; status = 'partial'; trusted = true;
         } else {
@@ -775,7 +814,7 @@ const Hybrid = (() => {
         if (Q) T.setRef(Q);
         // 3) Pin new texture points to the surface using this (trusted) pose
         if (trusted && Q) F.replenish(PD.homography(UNIT, Q));
-        return { quad: Q, status, reason: res && res.reason, points: F.points };
+        return { quad: Q, status, reason: res && res.reason, points: F.points, still };
       },
     };
   }
@@ -936,7 +975,7 @@ const STATUS = {
   found: ['Folha encontrada', 'found'],
   partial: ['Folha encontrada (um canto coberto)', 'found'],
   tracking: ['Acompanhando a folha', 'found'],
-  holding: ['Mantendo a posição', ''],
+  holding: ['Mantendo a posição (mova devagar)', ''],
   edge: ['Mostre os 4 cantos da folha', 'bad'],
   contrast: ['Coloque a folha sobre um fundo escuro', 'bad'],
   frozen: ['Fixado: pode mexer à vontade na folha', 'frozen'],
@@ -1004,7 +1043,10 @@ function loop(now) {
     const d = pctx.getImageData(0, 0, proc.width, proc.height).data;
     for (let i = 0, j = 0; i < gray.length; i++, j += 4) gray[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
     const out = tracker.update(gray);
-    const st = ['found', 'partial', 'tracking'].includes(out.status) ? out.status : (out.reason || out.status);
+    // Once the sheet has been found, getting close (corners out of view) is normal: never ask for the corners then
+    const st = out.quad
+      ? (['found', 'partial', 'tracking'].includes(out.status) ? out.status : 'holding')
+      : (out.reason || out.status);
     showStatus(st);
     edgeSince = st === 'edge' ? (edgeSince || now) : 0;
     if (out.quad) {
