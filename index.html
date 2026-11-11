@@ -76,8 +76,9 @@
   .hint { position: absolute; left: 50%; top: 42%; transform: translate(-50%,-50%); z-index: 15; color: #fff;
     background: rgba(0,0,0,.6); padding: 14px 18px; border-radius: 14px; text-align: center; font-size: 15px;
     line-height: 1.45; max-width: 84%; pointer-events: none; }
-  .panel .actions { grid-template-columns: repeat(5, 1fr); gap: 6px; }
-  .panel .actions button { font-size: 12px; padding: 10px 2px; }
+  .panel .actions { grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .panel .actions button { font-size: 13px; padding: 9px 2px; }
+  .panel .actions button.locked { background: #2f8a4c; }
   #calib { position: absolute; inset: 0; z-index: 40; background: #000; touch-action: none; }
   #calibCanvas { position: absolute; inset: 0; width: 100%; height: 100%; }
   #calibSvg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
@@ -182,6 +183,7 @@
       <button id="resetBtn">Centralizar</button>
       <button id="refindBtn">Achar folha</button>
       <button id="calibBtn">📐 Cantos</button>
+      <button id="lockBtn">🔒 Travar folha</button>
       <button id="freezeBtn">📌 Fixar</button>
     </div>
   </div>
@@ -886,7 +888,7 @@ const Hybrid = (() => {
     const STILL = 0.25;                       // px/frame below which the camera counts as still
     const DEAD = Math.max(1.5, diag * 0.004); // dead band: smaller corrections are ignored
     const SPREAD = 0.3;
-    let Q = null, disagree = 0, detBuf = [], detMiss = 0;
+    let Q = null, disagree = 0, detBuf = [], detMiss = 0, locked = false;
     const maxDist = (a, b) => Math.max(...a.map((p, i) => Math.hypot(p[0] - b[i][0], p[1] - b[i][1])));
     const lerpQ = (a, b, t) => a.map((p, i) => [p[0] + (b[i][0] - p[0]) * t, p[1] + (b[i][1] - p[1]) * t]);
     const med = arr => { const s = arr.slice().sort((a, b) => a - b); return s[s.length >> 1]; };
@@ -907,7 +909,9 @@ const Hybrid = (() => {
     }
 
     return {
-      reset() { T.reset(); F.reset(); Q = null; disagree = 0; detBuf = []; detMiss = 0; },
+      reset() { T.reset(); F.reset(); Q = null; disagree = 0; detBuf = []; detMiss = 0; locked = false; },
+      get locked() { return locked; },
+      setLocked(v) { locked = !!v && !!Q; return locked; },
       get quad() { return Q; },
       // Set the sheet by hand (user-placed corners) when there's no automatic detection
       setQuad(q) { Q = q.map(p => p.slice()); F.reset(); disagree = 0; T.setRef(Q); },
@@ -926,9 +930,11 @@ const Hybrid = (() => {
         const still = fl.motion !== null && fl.motion < STILL;
         if (pred) T.setRef(pred);
 
-        // 2) Corners → absolute pose when the whole sheet is cleanly visible (median of last few)
-        const res = PD.detect(gray, w, h, Q);
-        const out = T.update(res);
+        // 2) Corners → absolute pose when the whole sheet is cleanly visible.
+        //    When the sheet is LOCKED, skip this entirely: the confirmed corners stay as they
+        //    are and only the camera's motion moves the sketch (no automatic corrections).
+        const res = locked ? null : PD.detect(gray, w, h, Q);
+        const out = locked ? { status: 'holding' } : T.update(res);
         let det = null;
         if (out.status === 'found' && out.quad) { det = PD.align(out.quad, pred || Q || out.quad); detMiss = 0; }
         else detMiss++;
@@ -1121,7 +1127,21 @@ function setFrozen(v) {
   $('freezeBtn').textContent = v ? '📌 Fixado' : '📌 Fixar';
 }
 $('freezeBtn').onclick = () => setFrozen(!frozen);
-$('refindBtn').onclick = () => { tracker?.reset(); sm = null; orient = null; calib = null; autoCalibDone = false; setFrozen(false); };
+$('refindBtn').onclick = () => { tracker?.reset(); sm = null; orient = null; calib = null; autoCalibDone = false; setFrozen(false); updateLockBtn(); };
+
+/* ---------- Sheet lock: keep the confirmed corners, follow only the camera's motion ---------- */
+function updateLockBtn() {
+  const on = !!(tracker && tracker.locked);
+  $('lockBtn').classList.toggle('locked', on);
+  $('lockBtn').textContent = on ? '🔓 Destravar' : '🔒 Travar folha';
+  lastStatus = '';   // refresh the status text (it shows a lock icon)
+}
+$('lockBtn').onclick = () => {
+  if (!tracker) return;
+  if (tracker.locked) tracker.setLocked(false);
+  else if (!tracker.setLocked(true)) { $('hint').textContent = 'Primeiro deixe o app encontrar a folha (ou marque os cantos em 📐 Cantos).'; $('hint').classList.remove('hidden'); }
+  updateLockBtn();
+};
 
 /* ---------- Manual corners ----------
    The user can drag 4 points onto the sheet's exact corners. They are stored in the tracked
@@ -1247,7 +1267,8 @@ const STATUS = {
 function showStatus(s) {
   if (s === lastStatus) return; lastStatus = s;
   const [txt, cls] = STATUS[s] || STATUS.searching;
-  $('statusText').textContent = txt;
+  const lk = tracker && tracker.locked && s !== 'frozen';
+  $('statusText').textContent = lk ? '🔒 ' + (s === 'holding' ? 'Folha travada · parada' : 'Folha travada') : txt;
   $('status').className = 'pill' + (cls ? ' ' + cls : '');
   $('outline').classList.toggle('holding', s === 'holding');
 }
@@ -1268,7 +1289,7 @@ async function startAR() {
     await new Promise(r => v.videoWidth ? r() : v.addEventListener('loadedmetadata', r, { once: true }));
     proc.width = PROC_W; proc.height = Math.round(PROC_W * v.videoHeight / v.videoWidth);
     gray = new Uint8Array(proc.width * proc.height);
-    tracker = Hybrid.create(proc.width, proc.height);
+    tracker = Hybrid.create(proc.width, proc.height); updateLockBtn();
     $('loading').classList.add('hidden');
     running = true; lastFrame = performance.now();
     requestAnimationFrame(loop);
