@@ -48,6 +48,8 @@
   /* ---------- AR ---------- */
   #ar { position: fixed; inset: 0; background: #000; overflow: hidden; touch-action: none; }
   #video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  /* The picture actually shown: the SAME frame the tracker used, so sketch and paper stay in sync */
+  #view { position: absolute; inset: 0; width: 100%; height: 100%; }
   #stage { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
   #overlay { position: absolute; left: 0; top: 0; transform-origin: 0 0; will-change: transform; display: none; }
   #outline { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
@@ -165,6 +167,7 @@
 <!-- ================= AR ================= -->
 <section id="ar" class="hidden">
   <video id="video" playsinline muted autoplay></video>
+  <canvas id="view"></canvas>
   <div id="stage">
     <img id="overlay" alt="">
     <svg id="outline"><polygon points=""/></svg>
@@ -894,6 +897,17 @@ const Hybrid = (() => {
     const med = arr => { const s = arr.slice().sort((a, b) => a - b); return s[s.length >> 1]; };
     const medianQuad = buf => [0, 1, 2, 3].map(i => [med(buf.map(q => q[i][0])), med(buf.map(q => q[i][1]))]);
 
+    // The phone camera keeps changing exposure (a hand enters, the sheet fills the view...).
+    // Point tracking assumes constant brightness, so give it frames with a steady mean/contrast.
+    const gN = new Uint8Array(w * h);
+    function normalize(g) {
+      let s = 0, s2 = 0, n = 0;
+      for (let i = 0; i < g.length; i += 7) { const v = g[i]; s += v; s2 += v * v; n++; }
+      const m = s / n, sd = Math.sqrt(Math.max(1, s2 / n - m * m)), k = Math.min(2.5, 50 / sd);   // cap: never amplify sensor noise on blank paper
+      for (let i = 0; i < g.length; i++) { const v = (g[i] - m) * k + 128; gN[i] = v < 0 ? 0 : v > 255 ? 255 : v; }
+      return gN;
+    }
+
     function saneFrom(Qref) {
       return q => {
         if (!q || q.some(p => !isFinite(p[0]) || !isFinite(p[1]))) return false;
@@ -918,7 +932,7 @@ const Hybrid = (() => {
       update(gray) {
         // 1) Texture points (only proven ones vote) → candidate pose
         const Hprev = Q ? PD.homography(UNIT, Q) : null;
-        const fl = F.track(gray, Hprev);
+        const fl = F.track(normalize(gray), Hprev);
         let pred = null, Hpred = null;
         if (Q) {
           const sane = saneFrom(Q);
@@ -1006,8 +1020,12 @@ async function get(key) {
     r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); }); } catch (e) { return undefined; }
 }
 const SKEY = 'tracar-paper-settings';
-const DEFAULTS = { x: 0, y: 0, scale: 0.85, rot: 0, opacity: 0.55, smooth: 0.3, paper: '1.4142' };
-function loadSettings() { try { return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(SKEY) || '{}') }; } catch { return { ...DEFAULTS }; } }
+const DEFAULTS = { x: 0, y: 0, scale: 0.85, rot: 0, opacity: 0.55, smooth: 0.1, paper: '1.4142', v: 2 };
+function loadSettings() {
+  let s; try { s = { ...DEFAULTS, ...JSON.parse(localStorage.getItem(SKEY) || '{}') }; } catch { s = { ...DEFAULTS }; }
+  if (s.v !== 2) { s.smooth = 0.1; s.v = 2; }   // older versions smoothed a lot, which made the sketch lag and slide
+  return s;
+}
 function saveSettings() { try { localStorage.setItem(SKEY, JSON.stringify(settings)); } catch {} }
 let settings = loadSettings();
 $('paperSel').value = settings.paper;
@@ -1288,6 +1306,9 @@ async function startAR() {
     const v = $('video'); v.srcObject = stream; await v.play();
     await new Promise(r => v.videoWidth ? r() : v.addEventListener('loadedmetadata', r, { once: true }));
     proc.width = PROC_W; proc.height = Math.round(PROC_W * v.videoHeight / v.videoWidth);
+    sizeView();
+    newFrame = true;
+    if (v.requestVideoFrameCallback) { const cb = () => { newFrame = true; if (running) v.requestVideoFrameCallback(cb); }; v.requestVideoFrameCallback(cb); hasRVFC = true; }
     gray = new Uint8Array(proc.width * proc.height);
     tracker = Hybrid.create(proc.width, proc.height); updateLockBtn();
     $('loading').classList.add('hidden');
@@ -1308,6 +1329,18 @@ function stopAR() {
 }
 $('startBtn').onclick = startAR; $('resumeBtn').onclick = startAR; $('backBtn').onclick = stopAR;
 
+let newFrame = false, hasRVFC = false, lastVT = -1;
+const view = document.getElementById('view'), vctx = view.getContext('2d', { alpha: false });
+function sizeView() {
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  view.width = Math.round($('ar').clientWidth * dpr); view.height = Math.round($('ar').clientHeight * dpr);
+}
+window.addEventListener('resize', () => { if (running) sizeView(); });
+function drawView(v) {          // draw the frame like object-fit: cover
+  const W = view.width, H = view.height, s = Math.max(W / v.videoWidth, H / v.videoHeight);
+  vctx.drawImage(v, (W - v.videoWidth * s) / 2, (H - v.videoHeight * s) / 2, v.videoWidth * s, v.videoHeight * s);
+}
+
 // processing-canvas coords → screen coords (video is shown with object-fit: cover)
 function toScreen(q) {
   const v = $('video'), W = v.clientWidth, H = v.clientHeight;
@@ -1322,7 +1355,11 @@ function loop(now) {
   const dt = Math.min(0.1, (now - lastFrame) / 1000); lastFrame = now;
   const v = $('video');
 
-  if (!frozen && now - lastDetect > 25 && v.readyState >= 2) {
+  // A new camera frame? (requestVideoFrameCallback where available, otherwise the video clock)
+  if (!hasRVFC && v.currentTime !== lastVT) { lastVT = v.currentTime; newFrame = true; }
+  const fresh = newFrame && v.readyState >= 2; newFrame = false;
+  if (fresh) drawView(v);       // the background shown is the frame being tracked: no lag between them
+  if (!frozen && fresh) {
     lastDetect = now;
     pctx.drawImage(v, 0, 0, proc.width, proc.height);
     const d = pctx.getImageData(0, 0, proc.width, proc.height).data;
