@@ -76,6 +76,9 @@
   .hint { position: absolute; left: 50%; top: 42%; transform: translate(-50%,-50%); z-index: 15; color: #fff;
     background: rgba(0,0,0,.6); padding: 14px 18px; border-radius: 14px; text-align: center; font-size: 15px;
     line-height: 1.45; max-width: 84%; pointer-events: none; }
+  .tip { position: absolute; left: 12px; right: 12px; top: calc(env(safe-area-inset-top) + 60px); z-index: 16;
+    background: rgba(210,85,43,.92); color: #fff; padding: 10px 14px; border-radius: 12px; font-size: 14px;
+    line-height: 1.4; text-align: center; pointer-events: none; }
   #loading { position: absolute; inset: 0; z-index: 30; display: grid; place-items: center; color: #fff; background: #000; font-size: 15px; }
 </style>
 </head>
@@ -152,6 +155,7 @@
     <span class="pill" id="status"><span class="dot"></span><span id="statusText">Procurando a folha…</span></span>
   </div>
   <div class="hint" id="hint">Aponte para a folha inteira, sobre um fundo escuro</div>
+  <div class="tip hidden" id="tip">Folha muito lisa para acompanhar de perto: faça uns 20 “X” pequenos e leves a lápis espalhados pela folha.</div>
   <div class="panel" id="panel">
     <div class="grid" id="sliders"></div>
     <div class="actions">
@@ -291,12 +295,35 @@ const PaperDetect = (() => {
     return out;
   }
 
+  // Otsu restricted to the pixels brighter than `above` (separates a white sheet from a
+  // light-grey table when a dark area elsewhere in the picture took the first split)
+  function otsuAbove(g, above) {
+    const sub = []; for (let i = 0; i < g.length; i += 2) if (g[i] > above) sub.push(g[i]);
+    if (sub.length < 200) return null;
+    return otsu(Uint8Array.from(sub));
+  }
+
   // Main entry. prevQuad (optional) helps keep the same sheet when a hand splits it.
   function detect(grayIn, w, h, prevQuad) {
     const gb = blur3(grayIn, w, h);
     const ot = otsu(gb);
-    if (ot.gap < 45) return { reason: 'contrast' };    // sheet and surface too similar
-    const t0 = Math.max(ot.t, 60);
+    if (ot.gap < 45) {
+      // maybe only sheet vs light table is visible: still worth a try at the brighter split
+      const r = detectAt(gb, w, h, prevQuad, Math.max(ot.t, 60));
+      return (r && r.quad) ? r : { reason: 'contrast' };
+    }
+    let r = detectAt(gb, w, h, prevQuad, Math.max(ot.t, 60));
+    if (!r || !r.quad) {
+      const o2 = otsuAbove(gb, ot.t);
+      if (o2 && o2.gap >= 22) {
+        const r2 = detectAt(gb, w, h, prevQuad, o2.t);
+        if (r2 && r2.quad) return r2;
+      }
+    }
+    return r;
+  }
+
+  function detectAt(gb, w, h, prevQuad, t0) {
     const N = w * h;
     // Binary mask, then closing to erase pencil/pen strokes drawn on the sheet
     let m = new Uint8Array(N); for (let i = 0; i < N; i++) m[i] = gb[i] > t0 ? 1 : 0;
@@ -644,6 +671,46 @@ const FlowTrack = (() => {
     return [A / det, -(b * i - c * h) / det, (b * f - c * e) / det, B / det, (a * i - c * g) / det, -(a * f - c * d) / det, C / det, -(a * h - b * g) / det, (a * e - b * d) / det];
   }
 
+  // How well points cover the picture in 2D: sqrt(smallest / largest spread direction).
+  // ~0 = all on a line (perspective can't be trusted), ~1 = well spread.
+  function spreadOf(P) {
+    const n = P.length; if (n < 3) return 0;
+    let cx = 0, cy = 0; for (const p of P) { cx += p[0]; cy += p[1]; } cx /= n; cy /= n;
+    let a = 0, b = 0, c = 0; for (const p of P) { const dx = p[0] - cx, dy = p[1] - cy; a += dx * dx; b += dx * dy; c += dy * dy; }
+    const tr = a + c, det = a * c - b * b, d = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+    const l1 = tr / 2 + d, l2 = tr / 2 - d;
+    return l1 > 0 ? Math.sqrt(Math.max(0, l2) / l1) : 0;
+  }
+  // Similarity (shift + rotation + uniform zoom) A→B with RANSAC, as a 3x3 matrix.
+  function similarityLS(A, B) {
+    const n = A.length; let ax = 0, ay = 0, bx = 0, by = 0;
+    for (let i = 0; i < n; i++) { ax += A[i][0]; ay += A[i][1]; bx += B[i][0]; by += B[i][1]; }
+    ax /= n; ay /= n; bx /= n; by /= n;
+    let sxx = 0, sxy = 0, den = 0;
+    for (let i = 0; i < n; i++) {
+      const x = A[i][0] - ax, y = A[i][1] - ay, u = B[i][0] - bx, v = B[i][1] - by;
+      sxx += x * u + y * v; sxy += x * v - y * u; den += x * x + y * y;
+    }
+    if (den < 1e-9) return [1, 0, bx - ax, 0, 1, by - ay, 0, 0, 1];   // a single point: pure shift
+    const p = sxx / den, q = sxy / den;
+    return [p, -q, bx - (p * ax - q * ay), q, p, by - (q * ax + p * ay), 0, 0, 1];
+  }
+  function similarityRansac(A, B, thr) {
+    const n = A.length; let best = null, bestN = 0;
+    const iters = Math.min(120, n * (n - 1) / 2);
+    let s = 7;
+    for (let it = 0; it < iters; it++) {
+      s = (s * 16807) % 2147483647; const i = s % n; s = (s * 16807) % 2147483647; let j = s % n; if (j === i) j = (j + 1) % n;
+      const M = similarityLS([A[i], A[j]], [B[i], B[j]]);
+      let c = 0; for (let k = 0; k < n; k++) { const p = apply(M, A[k]); if (Math.hypot(p[0] - B[k][0], p[1] - B[k][1]) < thr) c++; }
+      if (c > bestN) { bestN = c; best = M; }
+    }
+    if (!best) return null;
+    const IA = [], IB = [];
+    for (let k = 0; k < n; k++) { const p = apply(best, A[k]); if (Math.hypot(p[0] - B[k][0], p[1] - B[k][1]) < thr) { IA.push(A[k]); IB.push(B[k]); } }
+    return { M: similarityLS(IA, IB), inliers: IA.length };
+  }
+
   function create(w, h, J, opts) {
     opts = opts || (typeof process !== 'undefined' && process.env && process.env.FLOWOPTS ? JSON.parse(process.env.FLOWOPTS) : null);
     J = J || (typeof jsfeat !== 'undefined' ? jsfeat : null);
@@ -663,18 +730,19 @@ const FlowTrack = (() => {
     const fromPts = [], toPts = [];
     for (let i = 0; i < MAXP; i++) { fromPts.push({ x: 0, y: 0 }); toPts.push({ x: 0, y: 0 }); }
     const maskM = new J.matrix_t(MAXP, 1, J.U8_t | J.C1_t);
-    J.yape06.laplacian_threshold = 18; J.yape06.min_eigen_value_threshold = 16;
+    // Only clear details (pencil marks, edges, wood grain), not camera noise on blank paper
+    J.yape06.laplacian_threshold = opts && opts.lap || 28; J.yape06.min_eigen_value_threshold = opts && opts.eig || 24;
 
     return {
       reset() { hasPrev = false; count = 0; },
       get points() { return count; },
       // 1) Follow the points into this frame and solve the sheet pose.
       //    Returns H mapping sheet coordinates → this frame's pixels (or null).
-      track(gray) {
+      track(gray, Hprev) {
         const base = currPyr.data[0];
         base.data.set(gray);
         currPyr.build(base, true);
-        let H = null, inl = 0, n = 0, motion = null;
+        let H = null, Hsim = null, inl = 0, simInl = 0, n = 0, motion = null, spread = 0;
         if (hasPrev && count >= 8) {
           J.optical_flow_lk.track(prevPyr, currPyr, xy, nxy, count, WIN, 25, status, 0.01, 0.0008);
           let k = 0; const disp = [];
@@ -688,31 +756,41 @@ const FlowTrack = (() => {
           count = k; n = k;
           if (disp.length >= 8) { disp.sort((a, b) => a - b); motion = disp[disp.length >> 1]; }   // median: robust to a moving hand
           for (let i = 0; i < n; i++) { fromPts[i].x = pl[i * 2]; fromPts[i].y = pl[i * 2 + 1]; toPts[i].x = xy[i * 2]; toPts[i].y = xy[i * 2 + 1]; }
+          // (a) full perspective model from the point map
           if (n >= 10 && J.motion_estimator.ransac(params, kernel, fromPts, toPts, n, model, maskM, 500)) {
             const S = [], D = [];
             for (let i = 0; i < n; i++) if (maskM.data[i]) { S.push([pl[i * 2], pl[i * 2 + 1]]); D.push([xy[i * 2], xy[i * 2 + 1]]); }
             inl = S.length;
-            if (inl >= Math.max(10, n * 0.4)) {
-              H = homographyLS(S, D, inl);
-              if (H) {   // final cleanup with the refined pose: drop points that don't fit,
-                         // and let each surviving point's surface position settle (averaging)
-                const Hi = REFINE ? inv(H) : null;
-                let k2 = 0;
-                for (let i = 0; i < n; i++) {
-                  const p = apply(H, [pl[i * 2], pl[i * 2 + 1]]);
-                  if (Math.hypot(p[0] - xy[i * 2], p[1] - xy[i * 2 + 1]) > 3) continue;
-                  let px = pl[i * 2], py = pl[i * 2 + 1];
-                  if (Hi) { const q = apply(Hi, [xy[i * 2], xy[i * 2 + 1]]); px += (q[0] - px) * REFINE; py += (q[1] - py) * REFINE; }
-                  xy[k2 * 2] = xy[i * 2]; xy[k2 * 2 + 1] = xy[i * 2 + 1]; pl[k2 * 2] = px; pl[k2 * 2 + 1] = py; k2++;
-                }
-                count = k2;
-              }
-            }
+            if (inl >= Math.max(10, n * 0.4)) { H = homographyLS(S, D, inl); spread = spreadOf(D); }
+          }
+          // (b) restricted model: last pose + shift/rotation/zoom only. Can't invent a tilt,
+          //     so it stays sane when the points are few or lined up (e.g. only the sheet's edge).
+          if (Hprev && n >= 3) {
+            const A = [], B = [];
+            for (let i = 0; i < n; i++) { A.push(apply(Hprev, [pl[i * 2], pl[i * 2 + 1]])); B.push([xy[i * 2], xy[i * 2 + 1]]); }
+            const sim = similarityRansac(A, B, 2.5);
+            if (sim && sim.inliers >= Math.max(3, n * 0.4)) Hsim = mul(sim.M, Hprev), simInl = sim.inliers;
           }
         } else count = 0;
         const t = prevPyr; prevPyr = currPyr; currPyr = t;   // this frame becomes "previous"
         hasPrev = true;
-        return { H, inliers: inl, tracked: n, motion };
+        return { H, Hsim, spread, inliers: inl, simInliers: simInl, tracked: n, motion };
+      },
+      // After the caller picks the pose for this frame: drop points that don't fit it and let
+      // the others' surface positions settle a little (averaging).
+      commit(Hc, refine) {
+        if (!Hc) return;
+        const rf = refine === undefined ? REFINE : refine;
+        const Hi = rf ? inv(Hc) : null;
+        let k2 = 0;
+        for (let i = 0; i < count; i++) {
+          const p = apply(Hc, [pl[i * 2], pl[i * 2 + 1]]);
+          if (Math.hypot(p[0] - xy[i * 2], p[1] - xy[i * 2 + 1]) > 3) continue;
+          let px = pl[i * 2], py = pl[i * 2 + 1];
+          if (Hi) { const q = apply(Hi, [xy[i * 2], xy[i * 2 + 1]]); px += (q[0] - px) * rf; py += (q[1] - py) * rf; }
+          xy[k2 * 2] = xy[i * 2]; xy[k2 * 2 + 1] = xy[i * 2 + 1]; pl[k2 * 2] = px; pl[k2 * 2 + 1] = py; k2++;
+        }
+        count = k2;
       },
       // Nudge every point's surface position toward where an absolute pose (from the sheet's
       // corners) says it is. Keeps the point map from slowly sliding over time.
@@ -767,6 +845,7 @@ const Hybrid = (() => {
     // quicker when moving (no lag); same for re-anchoring the point map
     const CORRECT_STILL = O.cs || 0.04, CORRECT_MOVING = O.cm || 0.15;
     const ANCHOR_STILL = 0.03, ANCHOR_MOVING = 0.1;
+    const SPREAD = O.spread || 0.3;
     let Q = null, disagree = 0, stillFrames = 0;
     const maxDist = (a, b) => Math.max(...a.map((p, i) => Math.hypot(p[0] - b[i][0], p[1] - b[i][1])));
     const lerpQ = (a, b, t) => a.map((p, i) => [p[0] + (b[i][0] - p[0]) * t, p[1] + (b[i][1] - p[1]) * t]);
@@ -775,8 +854,32 @@ const Hybrid = (() => {
       get quad() { return Q; },
       update(gray) {
         // 1) Texture points → where the sheet is now (corners may be far outside the frame)
-        const fl = F.track(gray);
-        const pred = (Q && fl.H) ? UNIT.map(p => FT.apply(fl.H, p)) : null;
+        const Hprev = Q ? PD.homography(UNIT, Q) : null;
+        const fl = F.track(gray, Hprev);
+        // Pick a motion model we can trust:
+        //  • full perspective only if the points are well spread over the picture;
+        //  • otherwise shift/rotate/zoom of the last pose (can't produce a crazy tilt);
+        //  • and in every case the result must still look like THIS sheet (same proportion,
+        //    no sudden size jump) — if not, keep the last pose instead of showing garbage.
+        let pred = null, Hused = null;
+        if (Q) {
+          const sane = q => {
+            if (!q || q.some(p => !isFinite(p[0]) || !isFinite(p[1]))) return false;
+            for (let i = 0; i < 4; i++) {   // convex, same winding
+              const a = q[i], b = q[(i + 1) % 4], c = q[(i + 2) % 4];
+              if ((b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]) <= 0) return false;
+            }
+            const ar = PD.polyArea(q) / PD.polyArea(Q);
+            if (!(ar > 0.75 && ar < 1.33)) return false;
+            const r = T.ratio, rr = PD.rectRatio(q, w, h);
+            return !r || (isFinite(rr) && Math.abs(rr / r - 1) < 0.2);
+          };
+          const qFull = fl.H ? UNIT.map(p => FT.apply(fl.H, p)) : null;
+          const qSim = fl.Hsim ? UNIT.map(p => FT.apply(fl.Hsim, p)) : null;
+          if (qFull && fl.spread >= SPREAD && fl.inliers >= 12 && sane(qFull)) { pred = qFull; Hused = fl.H; }
+          else if (qSim && sane(qSim)) { pred = qSim; Hused = fl.Hsim; }
+        }
+        F.commit(Hused);
         const still = fl.motion !== null && fl.motion < STILL;
         stillFrames = still ? stillFrames + 1 : 0;
         if (pred) T.setRef(pred);
@@ -795,10 +898,10 @@ const Hybrid = (() => {
               disagree = 0; status = 'found';
               target = lerpQ(pred, det, still ? CORRECT_STILL : CORRECT_MOVING);                      // gentle correction, no jump
               F.anchor(PD.homography(UNIT, det), still ? ANCHOR_STILL : ANCHOR_MOVING);                 // keep the point map honest
-            } else if (++disagree > 15) {                               // persistent: the map is wrong
+            } else if (++disagree > 5) {                                // the whole sheet keeps saying otherwise: the map is wrong
               target = det; disagree = 0; F.reset(); status = 'found';
             }
-          } else disagree = 0;
+          }
           // Dead band: camera not moving → don't move the sketch for tiny differences
           if (Q && still && maxDist(target, Q) < Math.max(1.5, diag * 0.004)) target = Q;
           Q = target;
@@ -957,7 +1060,7 @@ const PROC_W = 320;
 let stream = null, running = false, tracker = null, frozen = false;
 let sm = null;                // smoothed screen-space corners
 let orient = null;            // 'portrait' | 'landscape' (decided when the sheet is first found)
-let lastDetect = 0, lastFrame = 0, lastStatus = '', edgeSince = 0;
+let lastDetect = 0, lastFrame = 0, lastStatus = '', edgeSince = 0, lowTexSince = 0;
 const proc = document.createElement('canvas');
 const pctx = proc.getContext('2d', { willReadFrequently: true });
 let gray = null;
@@ -975,7 +1078,7 @@ const STATUS = {
   found: ['Folha encontrada', 'found'],
   partial: ['Folha encontrada (um canto coberto)', 'found'],
   tracking: ['Acompanhando a folha', 'found'],
-  holding: ['Mantendo a posição (mova devagar)', ''],
+  holding: ['Mantendo a posição', ''],
   edge: ['Mostre os 4 cantos da folha', 'bad'],
   contrast: ['Coloque a folha sobre um fundo escuro', 'bad'],
   frozen: ['Fixado: pode mexer à vontade na folha', 'frozen'],
@@ -1043,6 +1146,10 @@ function loop(now) {
     const d = pctx.getImageData(0, 0, proc.width, proc.height).data;
     for (let i = 0, j = 0; i < gray.length; i++, j += 4) gray[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
     const out = tracker.update(gray);
+    // Close to a blank sheet there is nothing to follow: suggest pencil marks
+    const lowTex = out.quad && out.status !== 'found' && out.points < 15;
+    lowTexSince = lowTex ? (lowTexSince || now) : 0;
+    $('tip').classList.toggle('hidden', !(lowTexSince && now - lowTexSince > 1200));
     // Once the sheet has been found, getting close (corners out of view) is normal: never ask for the corners then
     const st = out.quad
       ? (['found', 'partial', 'tracking'].includes(out.status) ? out.status : 'holding')
@@ -1063,7 +1170,7 @@ function loop(now) {
       }
       if (sm[0]._t === undefined) sm.forEach((p, i) => p._t = target[i]);
     }
-  } else if (frozen) showStatus('frozen');
+  } else if (frozen) { showStatus('frozen'); $('tip').classList.add('hidden'); lowTexSince = 0; }
 
   // Ease the smoothed corners toward their latest targets
   if (sm) {
