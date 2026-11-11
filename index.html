@@ -65,10 +65,11 @@
   .panel { position: absolute; left: 0; right: 0; bottom: 0; z-index: 20; background: rgba(20,18,16,.82);
     backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); color: #fff;
     padding: 12px 16px calc(env(safe-area-inset-bottom) + 12px); border-radius: 18px 18px 0 0; }
-  .panel .grid { display: grid; grid-template-columns: 82px 1fr 46px; gap: 4px 10px; align-items: center; font-size: 13px; }
+  .panel { background: rgba(20,18,16,.68); padding-top: 8px; }
+  .panel .grid { display: grid; grid-template-columns: 82px 1fr 46px; gap: 0 10px; align-items: center; font-size: 13px; }
   .panel .grid span.v { text-align: right; color: #cfc8bf; font-variant-numeric: tabular-nums; }
-  .panel input[type=range] { width: 100%; accent-color: var(--accent); height: 28px; }
-  .panel .actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; }
+  .panel input[type=range] { width: 100%; accent-color: var(--accent); height: 24px; margin: 1px 0; }
+  .panel .actions { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 8px; }
   .panel .actions button { background: rgba(255,255,255,.14); color: #fff; border: 0; border-radius: 10px;
     padding: 10px 4px; font-size: 13px; font-weight: 600; }
   .panel .actions button.on { background: #3d7ff0; }
@@ -361,8 +362,20 @@ const PaperDetect = (() => {
       }
       if (be >= 0) buckets[be].push([x + 0.5, y + 0.5]);
     }
+    const resid = (L, p) => Math.abs((p[0] - L.cx) * L.dy - (p[1] - L.cy) * L.dx);
     const lines = buckets.map((b, e) => {
-      if (b.length >= 8) return fitLine(b);
+      if (b.length >= 8) {
+        // Trimmed fit: drop points that don't lie on the line (e.g. a hand's outline), refit
+        let pts = b, L = fitLine(pts);
+        for (let it = 0; it < 3; it++) {
+          const rs = pts.map(p => resid(L, p)).sort((x, y) => x - y);
+          const cut = Math.max(1.0, rs[Math.floor(rs.length * 0.6)] * 2.5);
+          const kept = pts.filter(p => resid(L, p) <= cut);
+          if (kept.length < 8 || kept.length === pts.length) break;
+          pts = kept; L = fitLine(pts);
+        }
+        return L;
+      }
       const a = quad[e], c = quad[(e + 1) % 4], len = Math.hypot(c[0] - a[0], c[1] - a[1]);
       return { cx: a[0], cy: a[1], dx: (c[0] - a[0]) / len, dy: (c[1] - a[1]) / len };
     });
@@ -375,7 +388,37 @@ const PaperDetect = (() => {
     // A corner touching the frame edge means the sheet is cut off: its true corner is unknown
     const m2 = Math.max(2, w * 0.01);
     for (const p of refined) if (p[0] < m2 || p[1] < m2 || p[0] > w - m2 || p[1] > h - m2) return { reason: 'edge' };
-    return { quad: refined, area: polyArea(refined) };
+
+    // Corner confidence: near each corner, both edges should show a clean sheet/background
+    // transition right on the fitted line (sheet just inside, no sheet just outside).
+    // A hand over a corner breaks this on at least one side.
+    const ccx = (refined[0][0] + refined[1][0] + refined[2][0] + refined[3][0]) / 4;
+    const ccy = (refined[0][1] + refined[1][1] + refined[2][1] + refined[3][1]) / 4;
+    const selAt = (x, y) => { const xi = Math.round(x), yi = Math.round(y);
+      if (xi < 0 || yi < 0 || xi >= w || yi >= h) return -1; return isSel(yi * w + xi) ? 1 : 0; };
+    // Walk away from corner c along the fitted line L (towards corner `toward`), checking
+    // the transition at several points close to the corner.
+    const support = (c, L, toward) => {
+      const a = refined[c], b = refined[toward];
+      const len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+      let dx = L.dx, dy = L.dy;
+      if ((b[0] - a[0]) * dx + (b[1] - a[1]) * dy < 0) { dx = -dx; dy = -dy; }
+      let nx = -dy, ny = dx;                               // normal, flipped to point inward
+      if ((ccx - a[0]) * nx + (ccy - a[1]) * ny < 0) { nx = -nx; ny = -ny; }
+      const off = Math.max(2, w / 110);
+      let ok = 0, n = 0;
+      for (let k = 0; k <= 8; k++) {
+        const s = len * (0.04 + 0.18 * k / 8), px = a[0] + dx * s, py = a[1] + dy * s;
+        const inn = selAt(px + nx * off, py + ny * off), out = selAt(px - nx * off, py - ny * off);
+        if (inn < 0 || out < 0) continue;
+        n++; if (inn === 1 && out === 0) ok++;
+      }
+      return n ? ok / n : 0;
+    };
+    const conf = [0, 1, 2, 3].map(i => Math.min(
+      support(i, lines[(i + 3) % 4], (i + 3) % 4),
+      support(i, lines[i], (i + 1) % 4)));
+    return { quad: refined, area: polyArea(refined), conf };
   }
 
   // Is quad q a plausible continuation of reference quad ref (both aligned)?
@@ -441,32 +484,116 @@ const PaperDetect = (() => {
     return true;
   }
 
+  // Recover the real-world aspect ratio (long/short) of the rectangle seen as quad q,
+  // using the perspective geometry of a pinhole camera (Zhang & He, whiteboard scanning).
+  // q: clockwise [TL, TR, BR, BL] in pixels; w,h: image size. Focal length is assumed
+  // (~typical phone main camera); near a frontal view the result barely depends on it.
+  function rectRatio(q, w, h) {
+    const f = 0.75 * Math.max(w, h), cx = w / 2, cy = h / 2;   // iPhone main camera, 4:3 ≈ 69° on the long side
+    const P = p => [p[0] - cx, p[1] - cy, 1];
+    const m1 = P(q[0]), m2 = P(q[1]), m3 = P(q[3]), m4 = P(q[2]);   // TL, TR, BL, BR
+    const cr = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    const k2 = dot(cr(m1, m4), m3) / dot(cr(m2, m4), m3);
+    const k3 = dot(cr(m1, m4), m2) / dot(cr(m3, m4), m2);
+    const n2 = [k2 * m2[0] - m1[0], k2 * m2[1] - m1[1], k2 * m2[2] - m1[2]];
+    const n3 = [k3 * m3[0] - m1[0], k3 * m3[1] - m1[1], k3 * m3[2] - m1[2]];
+    const a = (n2[0] ** 2 + n2[1] ** 2) / (f * f) + n2[2] ** 2;
+    const b = (n3[0] ** 2 + n3[1] ** 2) / (f * f) + n3[2] ** 2;
+    if (!(a > 0 && b > 0)) return NaN;
+    const r = Math.sqrt(a / b);
+    return r >= 1 ? r : 1 / r;
+  }
+
+  // Affine map taking points a[0..2] → b[0..2] exactly. Returns f(p) or null.
+  function affine3(a, b) {
+    const [x1, y1] = a[0], [x2, y2] = a[1], [x3, y3] = a[2];
+    const det = (x2 - x1) * (y3 - y1) - (x3 - x1) * (y2 - y1);
+    if (Math.abs(det) < 1e-6) return null;
+    const solve = (v1, v2, v3) => {   // v = A*x + B*y + C
+      const A = ((v2 - v1) * (y3 - y1) - (v3 - v1) * (y2 - y1)) / det;
+      const B = ((x2 - x1) * (v3 - v1) - (x3 - x1) * (v2 - v1)) / det;
+      return [A, B, v1 - A * x1 - B * y1];
+    };
+    const X = solve(b[0][0], b[1][0], b[2][0]), Y = solve(b[0][1], b[1][1], b[2][1]);
+    const f = p => [X[0] * p[0] + X[1] * p[1] + X[2], Y[0] * p[0] + Y[1] * p[1] + Y[2]];
+    f.scale = Math.sqrt(Math.abs(X[0] * Y[1] - X[1] * Y[0]));
+    return f;
+  }
+  // q: new (partly wrong) detection, ref: last good quad (aligned). Try each corner as the
+  // hidden one; keep the variant that is a valid view of the sheet and whose hidden corner
+  // disagrees most with the detection (that is the corner the hand is on).
+  function threeCorner(q, ref, ratio, w, h, tol, only) {
+    let best = null, bestD = -1;
+    for (let k = 0; k < 4; k++) {
+      if (only !== undefined && k !== only) continue;
+      const idx = [0, 1, 2, 3].filter(i => i !== k);
+      const A = affine3(idx.map(i => ref[i]), idx.map(i => q[i]));
+      if (!A || A.scale < 0.8 || A.scale > 1.25) continue;
+      const pk = A(ref[k]);
+      const q2 = q.map(p => p.slice()); q2[k] = pk;
+      const rr = rectRatio(q2, w, h);
+      if (!isFinite(rr) || Math.abs(rr / ratio - 1) >= tol) continue;
+      const d = Math.hypot(q[k][0] - pk[0], q[k][1] - pk[1]);
+      if (d > bestD) { bestD = d; best = q2; }
+    }
+    return best;
+  }
+
   // Stateful tracker. update(detectResult) → { quad (or null), status }
-  // status: 'searching' | 'found' | 'holding' | 'edge' | 'contrast'
-  function createTracker(w) {
-    let ref = null, cand = null, candN = 0;
-    const NEED_START = 3, NEED_JUMP = 8;
+  // status: 'searching' | 'found' | 'holding'
+  // A detection is trusted when its 4 corners are a believable view of the same sheet:
+  // its recovered real-world proportion matches the one learned at the start.
+  // Camera motion (any speed, tilt, zoom) keeps the proportion; a hand covering a corner breaks it.
+  function createTracker(w, h, tol) {
+    h = h || w * 0.75;
+    let ref = null, ratio = null, warm = [];
+    const TOL = tol || 0.08, CONF = 0.6;
     return {
-      reset() { ref = null; cand = null; candN = 0; },
+      reset() { ref = null; ratio = null; warm = []; },
       get quad() { return ref; },
+      get ratio() { return ratio; },
       update(res) {
-        if (!res || !res.quad) {
-          const st = ref ? 'holding' : (res && res.reason) || 'searching';
-          return { quad: ref, status: ref ? 'holding' : st, reason: res && res.reason };
+        if (!res || !res.quad) return { quad: ref, status: ref ? 'holding' : 'searching', reason: res && res.reason };
+        const q = align(res.quad, ref || (warm.length ? warm[warm.length - 1].q : null));
+        const rot = res.quad.indexOf(q[0]);
+        const conf = res.conf ? [0, 1, 2, 3].map(i => res.conf[(i + rot) % 4]) : [1, 1, 1, 1];
+        const badIdx = [0, 1, 2, 3].filter(i => conf[i] < CONF);
+        const rr = rectRatio(q, w, h);
+        // Exactly one corner looks covered: rebuild it from the other three
+        if (ref && ratio !== null && badIdx.length === 1) {
+          const q2 = threeCorner(q, ref, ratio, w, h, TOL, badIdx[0]);
+          if (q2) { ref = q2; return { quad: ref, status: 'partial' }; }
+          return { quad: ref, status: 'holding' };
         }
-        const q = align(res.quad, ref || cand);
-        if (ref && consistent(q, ref, w)) { ref = q; cand = null; candN = 0; return { quad: ref, status: 'found' }; }
-        // Not a smooth continuation: build up a candidate before believing it
-        if (cand && consistent(q, cand, w)) candN++; else candN = 1;
-        cand = q;
-        const need = ref ? NEED_JUMP : NEED_START;
-        if (candN >= need && (!ref || shapeSim(cand, ref))) { ref = cand; cand = null; candN = 0; return { quad: ref, status: 'found' }; }
-        return { quad: ref, status: ref ? 'holding' : 'searching' };
+        if (badIdx.length > 1) return { quad: ref, status: ref ? 'holding' : 'searching' };
+        if (!isFinite(rr)) return { quad: ref, status: ref ? 'holding' : 'searching' };
+        if (ratio === null) {
+          // Learn the sheet's proportion from a few steady, agreeing frames
+          const last = warm[warm.length - 1];
+          if (last && consistent(q, last.q, w) && Math.abs(rr / last.rr - 1) < TOL) warm.push({ q, rr }); else warm = [{ q, rr }];
+          if (warm.length >= 4) {
+            const s = warm.map(x => x.rr).sort((a, b) => a - b);
+            ratio = (s[1] + s[2]) / 2; ref = q; warm = [];
+            return { quad: ref, status: 'found' };
+          }
+          return { quad: ref, status: 'searching' };
+        }
+        if (Math.abs(rr / ratio - 1) < TOL) {
+          ratio += (rr - ratio) * 0.03;   // follow slow drift (e.g. strong tilt with an imperfect focal guess)
+          ref = q; return { quad: ref, status: 'found' };
+        }
+        // Tiny, rigid movement relative to the last good pose is always fine
+        if (ref) {
+          const d = q.map((p, i) => Math.hypot(p[0] - ref[i][0], p[1] - ref[i][1]));
+          if (Math.max(...d) < w * 0.006) { ref = q; return { quad: ref, status: 'found' }; }
+        }
+        return { quad: ref, status: 'holding' };
       },
     };
   }
 
-  return { detect, align, consistent, shapeSim, createTracker, homography, polyArea, orderCW };
+  return { detect, align, consistent, shapeSim, rectRatio, createTracker, homography, polyArea, orderCW };
 })();
 if (typeof module !== 'undefined') module.exports = PaperDetect;
 
@@ -605,7 +732,7 @@ const PROC_W = 320;
 let stream = null, running = false, tracker = null, frozen = false;
 let sm = null;                // smoothed screen-space corners
 let orient = null;            // 'portrait' | 'landscape' (decided when the sheet is first found)
-let lastDetect = 0, lastFrame = 0, lastStatus = '';
+let lastDetect = 0, lastFrame = 0, lastStatus = '', edgeSince = 0;
 const proc = document.createElement('canvas');
 const pctx = proc.getContext('2d', { willReadFrequently: true });
 let gray = null;
@@ -621,6 +748,7 @@ $('refindBtn').onclick = () => { tracker?.reset(); sm = null; orient = null; set
 const STATUS = {
   searching: ['Procurando a folha…', ''],
   found: ['Folha encontrada', 'found'],
+  partial: ['Folha encontrada (um canto coberto)', 'found'],
   holding: ['Mantendo a posição', ''],
   edge: ['Mostre os 4 cantos da folha', 'bad'],
   contrast: ['Coloque a folha sobre um fundo escuro', 'bad'],
@@ -643,13 +771,14 @@ async function startAR() {
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
+      // 4:3 shows more of the sheet than 16:9 (which crops the sensor's short side)
+      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 960 }, aspectRatio: { ideal: 4 / 3 } },
     });
     const v = $('video'); v.srcObject = stream; await v.play();
     await new Promise(r => v.videoWidth ? r() : v.addEventListener('loadedmetadata', r, { once: true }));
     proc.width = PROC_W; proc.height = Math.round(PROC_W * v.videoHeight / v.videoWidth);
     gray = new Uint8Array(proc.width * proc.height);
-    tracker = PD.createTracker(proc.width);
+    tracker = PD.createTracker(proc.width, proc.height);
     $('loading').classList.add('hidden');
     running = true; lastFrame = performance.now();
     requestAnimationFrame(loop);
@@ -689,7 +818,9 @@ function loop(now) {
     for (let i = 0, j = 0; i < gray.length; i++, j += 4) gray[i] = (d[j] * 77 + d[j + 1] * 150 + d[j + 2] * 29) >> 8;
     const res = PD.detect(gray, proc.width, proc.height, tracker.quad);
     const out = tracker.update(res);
-    showStatus(out.status === 'holding' && res && res.reason ? res.reason : out.status);
+    const st = (res && res.reason && out.status !== 'found') ? res.reason : out.status;
+    showStatus(st);
+    edgeSince = st === 'edge' ? (edgeSince || now) : 0;
     if (out.quad) {
       const target = toScreen(out.quad);
       if (!sm) {
@@ -712,7 +843,12 @@ function loop(now) {
     for (const p of sm) if (p._t) { p[0] += (p._t[0] - p[0]) * k; p[1] += (p._t[1] - p[1]) * k; }
     render();
   }
-  $('hint').classList.toggle('hidden', !!sm);
+  const edgeLong = !frozen && edgeSince && now - edgeSince > 700;
+  if (edgeLong) $('hint').textContent = 'Afaste o celular: os 4 cantos da folha precisam aparecer';
+  else if (!sm) $('hint').textContent = lastStatus === 'contrast'
+    ? 'Coloque a folha sobre um fundo escuro (mesa escura, pano ou cartolina)'
+    : 'Aponte para a folha inteira, sobre um fundo escuro';
+  $('hint').classList.toggle('hidden', !!sm && !edgeLong);
   requestAnimationFrame(loop);
 }
 
