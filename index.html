@@ -76,6 +76,25 @@
   .hint { position: absolute; left: 50%; top: 42%; transform: translate(-50%,-50%); z-index: 15; color: #fff;
     background: rgba(0,0,0,.6); padding: 14px 18px; border-radius: 14px; text-align: center; font-size: 15px;
     line-height: 1.45; max-width: 84%; pointer-events: none; }
+  .panel .actions { grid-template-columns: repeat(5, 1fr); gap: 6px; }
+  .panel .actions button { font-size: 12px; padding: 10px 2px; }
+  #calib { position: absolute; inset: 0; z-index: 40; background: #000; touch-action: none; }
+  #calibCanvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #calibSvg { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #calibSvg polygon { fill: rgba(76,209,122,.12); stroke: #4cd17a; stroke-width: 2; }
+  .handle { position: absolute; left: 0; top: 0; width: 30px; height: 30px; margin: -15px 0 0 -15px; border-radius: 50%;
+    background: rgba(210,85,43,.35); border: 3px solid #fff; box-shadow: 0 1px 6px rgba(0,0,0,.5); touch-action: none; }
+  .handle::before { content: ''; position: absolute; inset: -16px; border-radius: 50%; }   /* bigger touch area */
+  .handle::after { content: ''; position: absolute; left: 50%; top: 50%; width: 4px; height: 4px; margin: -2px; border-radius: 50%; background: #fff; }
+  .handle.active { background: rgba(210,85,43,.8); }
+  #loupe { position: absolute; width: 132px; height: 132px; border-radius: 50%; border: 3px solid #fff;
+    box-shadow: 0 4px 16px rgba(0,0,0,.6); pointer-events: none; z-index: 2; }
+  .calibTop { position: absolute; left: 12px; right: 12px; top: calc(env(safe-area-inset-top) + 12px); background: rgba(0,0,0,.65);
+    color: #fff; padding: 10px 14px; border-radius: 12px; text-align: center; font-size: 15px; font-weight: 600; pointer-events: none; }
+  .calibBar { position: absolute; left: 12px; right: 12px; bottom: calc(env(safe-area-inset-bottom) + 14px); display: flex; gap: 10px; }
+  .calibBar button { flex: 1; border: 0; border-radius: 12px; padding: 14px; font-weight: 700; font-size: 16px;
+    background: rgba(255,255,255,.9); color: var(--ink); }
+  .calibBar button.primary { background: var(--accent); color: #fff; }
   .tip { position: absolute; left: 12px; right: 12px; top: calc(env(safe-area-inset-top) + 60px); z-index: 16;
     background: rgba(210,85,43,.92); color: #fff; padding: 10px 14px; border-radius: 12px; font-size: 14px;
     line-height: 1.4; text-align: center; pointer-events: none; }
@@ -162,10 +181,25 @@
       <button id="hideBtn">Esconder</button>
       <button id="resetBtn">Centralizar</button>
       <button id="refindBtn">Achar folha</button>
+      <button id="calibBtn">📐 Cantos</button>
       <button id="freezeBtn">📌 Fixar</button>
     </div>
   </div>
   <button class="pill hidden" id="showBtn" style="position:absolute;right:12px;bottom:calc(env(safe-area-inset-bottom) + 14px);z-index:20">Ajustes</button>
+
+  <!-- Manual corner adjustment (frozen camera image + 4 draggable points + magnifier) -->
+  <div id="calib" class="hidden">
+    <canvas id="calibCanvas"></canvas>
+    <svg id="calibSvg"><polygon points=""/></svg>
+    <div class="handle" data-i="0"></div><div class="handle" data-i="1"></div>
+    <div class="handle" data-i="2"></div><div class="handle" data-i="3"></div>
+    <canvas id="loupe" class="hidden"></canvas>
+    <div class="calibTop">Arraste os 4 pontos até os cantos exatos da folha</div>
+    <div class="calibBar">
+      <button id="calibCancel">Cancelar</button>
+      <button id="calibOk" class="primary">Confirmar cantos</button>
+    </div>
+  </div>
 </section>
 
 <script>
@@ -720,6 +754,10 @@ const FlowTrack = (() => {
     prevPyr.allocate(w, h, T); currPyr.allocate(w, h, T);
     let xy = new Float32Array(MAXP * 2), nxy = new Float32Array(MAXP * 2);
     let pl = new Float64Array(MAXP * 2);           // surface (sheet) coordinates of each point
+    const age = new Uint16Array(MAXP);             // frames a point has stayed glued to the surface
+    // New points are on probation: they only get a vote once they've proven to stay put on the
+    // sheet. A pencil or hand keeps moving, so it never earns a vote and can't drag the sketch.
+    const MATURE = opts && opts.mature || 6;
     const status = new Uint8Array(MAXP);
     let count = 0, hasPrev = false;
     const kp = []; for (let i = 0; i < w * h; i++) kp.push(new J.keypoint_t(0, 0, 0, 0));
@@ -736,6 +774,7 @@ const FlowTrack = (() => {
     return {
       reset() { hasPrev = false; count = 0; },
       get points() { return count; },
+      get mature() { let m = 0; for (let i = 0; i < count; i++) if (age[i] >= MATURE) m++; return m; },
       // 1) Follow the points into this frame and solve the sheet pose.
       //    Returns H mapping sheet coordinates → this frame's pixels (or null).
       track(gray, Hprev) {
@@ -750,16 +789,18 @@ const FlowTrack = (() => {
             if (!status[i]) continue;
             const x = nxy[i * 2], y = nxy[i * 2 + 1];
             if (x < 2 || y < 2 || x > w - 3 || y > h - 3) continue;
-            disp.push(Math.hypot(x - xy[i * 2], y - xy[i * 2 + 1]));
-            xy[k * 2] = x; xy[k * 2 + 1] = y; pl[k * 2] = pl[i * 2]; pl[k * 2 + 1] = pl[i * 2 + 1]; k++;
+            if (age[i] >= MATURE) disp.push(Math.hypot(x - xy[i * 2], y - xy[i * 2 + 1]));
+            xy[k * 2] = x; xy[k * 2 + 1] = y; pl[k * 2] = pl[i * 2]; pl[k * 2 + 1] = pl[i * 2 + 1]; age[k] = age[i]; k++;
           }
-          count = k; n = k;
+          count = k;
+          const vote = []; for (let i = 0; i < k; i++) if (age[i] >= MATURE) vote.push(i);
+          n = vote.length;
           if (disp.length >= 8) { disp.sort((a, b) => a - b); motion = disp[disp.length >> 1]; }   // median: robust to a moving hand
-          for (let i = 0; i < n; i++) { fromPts[i].x = pl[i * 2]; fromPts[i].y = pl[i * 2 + 1]; toPts[i].x = xy[i * 2]; toPts[i].y = xy[i * 2 + 1]; }
+          for (let j = 0; j < n; j++) { const i = vote[j]; fromPts[j].x = pl[i * 2]; fromPts[j].y = pl[i * 2 + 1]; toPts[j].x = xy[i * 2]; toPts[j].y = xy[i * 2 + 1]; }
           // (a) full perspective model from the point map
           if (n >= 10 && J.motion_estimator.ransac(params, kernel, fromPts, toPts, n, model, maskM, 500)) {
             const S = [], D = [];
-            for (let i = 0; i < n; i++) if (maskM.data[i]) { S.push([pl[i * 2], pl[i * 2 + 1]]); D.push([xy[i * 2], xy[i * 2 + 1]]); }
+            for (let j = 0; j < n; j++) if (maskM.data[j]) { const i = vote[j]; S.push([pl[i * 2], pl[i * 2 + 1]]); D.push([xy[i * 2], xy[i * 2 + 1]]); }
             inl = S.length;
             if (inl >= Math.max(10, n * 0.4)) { H = homographyLS(S, D, inl); spread = spreadOf(D); }
           }
@@ -767,7 +808,7 @@ const FlowTrack = (() => {
           //     so it stays sane when the points are few or lined up (e.g. only the sheet's edge).
           if (Hprev && n >= 3) {
             const A = [], B = [];
-            for (let i = 0; i < n; i++) { A.push(apply(Hprev, [pl[i * 2], pl[i * 2 + 1]])); B.push([xy[i * 2], xy[i * 2 + 1]]); }
+            for (const i of vote) { A.push(apply(Hprev, [pl[i * 2], pl[i * 2 + 1]])); B.push([xy[i * 2], xy[i * 2 + 1]]); }
             const sim = similarityRansac(A, B, 2.5);
             if (sim && sim.inliers >= Math.max(3, n * 0.4)) Hsim = mul(sim.M, Hprev), simInl = sim.inliers;
           }
@@ -788,7 +829,7 @@ const FlowTrack = (() => {
           if (Math.hypot(p[0] - xy[i * 2], p[1] - xy[i * 2 + 1]) > 3) continue;
           let px = pl[i * 2], py = pl[i * 2 + 1];
           if (Hi) { const q = apply(Hi, [xy[i * 2], xy[i * 2 + 1]]); px += (q[0] - px) * rf; py += (q[1] - py) * rf; }
-          xy[k2 * 2] = xy[i * 2]; xy[k2 * 2 + 1] = xy[i * 2 + 1]; pl[k2 * 2] = px; pl[k2 * 2 + 1] = py; k2++;
+          xy[k2 * 2] = xy[i * 2]; xy[k2 * 2 + 1] = xy[i * 2 + 1]; pl[k2 * 2] = px; pl[k2 * 2 + 1] = py; age[k2] = Math.min(60000, age[i] + 1); k2++;
         }
         count = k2;
       },
@@ -819,7 +860,7 @@ const FlowTrack = (() => {
           for (let i = 0; i < count; i++) { const dx = xy[i * 2] - k.x, dy = xy[i * 2 + 1] - k.y; if (dx * dx + dy * dy < 49) { near = true; break; } }
           if (near) continue;
           const p = apply(Hi, [k.x, k.y]);
-          xy[count * 2] = k.x; xy[count * 2 + 1] = k.y; pl[count * 2] = p[0]; pl[count * 2 + 1] = p[1]; count++; cells[ci]++;
+          xy[count * 2] = k.x; xy[count * 2 + 1] = k.y; pl[count * 2] = p[0]; pl[count * 2 + 1] = p[1]; age[count] = 0; count++; cells[ci]++;
         }
       },
     };
@@ -828,96 +869,105 @@ const FlowTrack = (() => {
 })();
 if (typeof module !== 'undefined') module.exports = FlowTrack;
 
-// ===== Hybrid tracker: sheet corners (absolute, drift-free) + surface texture tracking (works close up)
-// Design goals: the sketch must never wander on its own.
-//  • Texture tracking drives the pose frame to frame (smooth, works close up).
-//  • The corner detector only CORRECTS it gently (no jumps), and re-anchors the point map.
-//  • When the camera isn't moving, the pose is frozen exactly (dead band).
+// ===== Hybrid tracker: the sheet's corners (absolute, can't be dragged by a pencil) +
+// surface texture tracking (works close up, when the corners are out of view).
+// Design goals: the sketch must stay glued to the paper and never wander on its own.
+//  • Whole sheet visible → the corners decide (median-filtered + dead band: no shimmer).
+//    Things moving over the sheet (pencil, hand) can't move the sketch.
+//  • Corners out of view → texture points decide, but only points that have PROVEN to stay
+//    put on the surface get a vote, and the motion model can't invent a crazy tilt.
+//  • Nothing reliable → keep the last pose (never show garbage).
 const Hybrid = (() => {
   const UNIT = [[0, 0], [1, 0], [1, 1], [0, 1]];       // sheet coordinates of the 4 corners
   function create(w, h, PD, FT, J) {
     PD = PD || PaperDetect; FT = FT || FlowTrack;
     const T = PD.createTracker(w, h), F = FT.create(w, h, J);
     const diag = Math.hypot(w, h);
-    const STILL = 0.25;        // px/frame (processing resolution) below which the camera counts as still
-    const O = (typeof process !== "undefined" && process.env && process.env.HYOPTS) ? JSON.parse(process.env.HYOPTS) : {};
-    // share of the corner-detector correction applied per frame: gentle when still (no shimmer),
-    // quicker when moving (no lag); same for re-anchoring the point map
-    const CORRECT_STILL = O.cs || 0.04, CORRECT_MOVING = O.cm || 0.15;
-    const ANCHOR_STILL = 0.03, ANCHOR_MOVING = 0.1;
-    const SPREAD = O.spread || 0.3;
-    let Q = null, disagree = 0, stillFrames = 0;
+    const STILL = 0.25;                       // px/frame below which the camera counts as still
+    const DEAD = Math.max(1.5, diag * 0.004); // dead band: smaller corrections are ignored
+    const SPREAD = 0.3;
+    let Q = null, disagree = 0, detBuf = [], detMiss = 0;
     const maxDist = (a, b) => Math.max(...a.map((p, i) => Math.hypot(p[0] - b[i][0], p[1] - b[i][1])));
     const lerpQ = (a, b, t) => a.map((p, i) => [p[0] + (b[i][0] - p[0]) * t, p[1] + (b[i][1] - p[1]) * t]);
+    const med = arr => { const s = arr.slice().sort((a, b) => a - b); return s[s.length >> 1]; };
+    const medianQuad = buf => [0, 1, 2, 3].map(i => [med(buf.map(q => q[i][0])), med(buf.map(q => q[i][1]))]);
+
+    function saneFrom(Qref) {
+      return q => {
+        if (!q || q.some(p => !isFinite(p[0]) || !isFinite(p[1]))) return false;
+        for (let i = 0; i < 4; i++) {   // convex, same winding
+          const a = q[i], b = q[(i + 1) % 4], c = q[(i + 2) % 4];
+          if ((b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]) <= 0) return false;
+        }
+        const ar = PD.polyArea(q) / PD.polyArea(Qref);
+        if (!(ar > 0.75 && ar < 1.33)) return false;
+        const r = T.ratio, rr = PD.rectRatio(q, w, h);
+        return !r || (isFinite(rr) && Math.abs(rr / r - 1) < 0.2);
+      };
+    }
+
     return {
-      reset() { T.reset(); F.reset(); Q = null; disagree = 0; stillFrames = 0; },
+      reset() { T.reset(); F.reset(); Q = null; disagree = 0; detBuf = []; detMiss = 0; },
       get quad() { return Q; },
+      // Set the sheet by hand (user-placed corners) when there's no automatic detection
+      setQuad(q) { Q = q.map(p => p.slice()); F.reset(); disagree = 0; T.setRef(Q); },
       update(gray) {
-        // 1) Texture points → where the sheet is now (corners may be far outside the frame)
+        // 1) Texture points (only proven ones vote) → candidate pose
         const Hprev = Q ? PD.homography(UNIT, Q) : null;
         const fl = F.track(gray, Hprev);
-        // Pick a motion model we can trust:
-        //  • full perspective only if the points are well spread over the picture;
-        //  • otherwise shift/rotate/zoom of the last pose (can't produce a crazy tilt);
-        //  • and in every case the result must still look like THIS sheet (same proportion,
-        //    no sudden size jump) — if not, keep the last pose instead of showing garbage.
-        let pred = null, Hused = null;
+        let pred = null, Hpred = null;
         if (Q) {
-          const sane = q => {
-            if (!q || q.some(p => !isFinite(p[0]) || !isFinite(p[1]))) return false;
-            for (let i = 0; i < 4; i++) {   // convex, same winding
-              const a = q[i], b = q[(i + 1) % 4], c = q[(i + 2) % 4];
-              if ((b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]) <= 0) return false;
-            }
-            const ar = PD.polyArea(q) / PD.polyArea(Q);
-            if (!(ar > 0.75 && ar < 1.33)) return false;
-            const r = T.ratio, rr = PD.rectRatio(q, w, h);
-            return !r || (isFinite(rr) && Math.abs(rr / r - 1) < 0.2);
-          };
+          const sane = saneFrom(Q);
           const qFull = fl.H ? UNIT.map(p => FT.apply(fl.H, p)) : null;
           const qSim = fl.Hsim ? UNIT.map(p => FT.apply(fl.Hsim, p)) : null;
-          if (qFull && fl.spread >= SPREAD && fl.inliers >= 12 && sane(qFull)) { pred = qFull; Hused = fl.H; }
-          else if (qSim && sane(qSim)) { pred = qSim; Hused = fl.Hsim; }
+          if (qFull && fl.spread >= SPREAD && fl.inliers >= 12 && sane(qFull)) { pred = qFull; Hpred = fl.H; }
+          else if (qSim && sane(qSim)) { pred = qSim; Hpred = fl.Hsim; }
         }
-        F.commit(Hused);
         const still = fl.motion !== null && fl.motion < STILL;
-        stillFrames = still ? stillFrames + 1 : 0;
         if (pred) T.setRef(pred);
-        // 2) Corner detection → absolute reference whenever the whole sheet is cleanly visible
+
+        // 2) Corners → absolute pose when the whole sheet is cleanly visible (median of last few)
         const res = PD.detect(gray, w, h, Q);
         const out = T.update(res);
-        const det = (out.status === 'found' && out.quad) ? PD.align(out.quad, pred || Q || out.quad) : null;
+        let det = null;
+        if (out.status === 'found' && out.quad) { det = PD.align(out.quad, pred || Q || out.quad); detMiss = 0; }
+        else detMiss++;
 
-        let status, trusted = false;
-        if (pred) {
+        let status, trusted = false, Hcommit = null;
+        if (det) {
+          // Whole sheet visible. Proven texture points give the motion (no lag); the corners
+          // pull the result firmly onto the sheet — a pencil moving over it can't win against them.
+          const base = pred || Q || det;
+          const d = maxDist(det, base);
+          if (!Q) { Q = det; disagree = 0; }
+          else if (d < diag * 0.06) {
+            disagree = 0;
+            let target = lerpQ(base, det, still ? 0.06 : 0.3);
+            if (still && maxDist(target, Q) < DEAD) target = Q;      // camera still → sketch still
+            Q = target;
+            F.anchor(PD.homography(UNIT, det), still ? 0.03 : 0.1);
+          } else if (++disagree > 5) {                                  // corners insist: re-anchor
+            Q = det; disagree = 0; F.reset();
+          } else Q = base;
+          status = 'found'; trusted = true;
+          Hcommit = PD.homography(UNIT, Q);
+        } else if (pred) {
+          // Corners not usable (close up / covered): proven texture points decide
           let target = pred;
-          status = 'tracking'; trusted = true;
-          if (det) {
-            const d = maxDist(det, pred);
-            if (d < diag * 0.06) {
-              disagree = 0; status = 'found';
-              target = lerpQ(pred, det, still ? CORRECT_STILL : CORRECT_MOVING);                      // gentle correction, no jump
-              F.anchor(PD.homography(UNIT, det), still ? ANCHOR_STILL : ANCHOR_MOVING);                 // keep the point map honest
-            } else if (++disagree > 5) {                                // the whole sheet keeps saying otherwise: the map is wrong
-              target = det; disagree = 0; F.reset(); status = 'found';
-            }
-          }
-          // Dead band: camera not moving → don't move the sketch for tiny differences
-          if (Q && still && maxDist(target, Q) < Math.max(1.5, diag * 0.004)) target = Q;
-          Q = target;
-        } else if (det) {
-          // No texture lock (start, or after a reset): use the corners, smoothed if we had a pose
-          Q = (Q && maxDist(det, Q) < diag * 0.03) ? lerpQ(Q, det, 0.35) : det;
-          status = 'found'; trusted = true; disagree = 0;
+          if (still && maxDist(target, Q) < DEAD) target = Q;   // camera still → sketch still
+          Q = target; status = 'tracking'; trusted = true; Hcommit = Hpred;
         } else if (out.status === 'partial' && out.quad) {
-          Q = out.quad; status = 'partial'; trusted = true;
+          Q = out.quad; status = 'partial'; trusted = true; Hcommit = PD.homography(UNIT, Q);
         } else {
           status = Q ? 'holding' : ((res && res.reason) || out.status);
+          // let points keep proving themselves if the camera is clearly still
+          if (Q && still) Hcommit = Hprev;
         }
+        F.commit(Hcommit);
         if (Q) T.setRef(Q);
         // 3) Pin new texture points to the surface using this (trusted) pose
         if (trusted && Q) F.replenish(PD.homography(UNIT, Q));
-        return { quad: Q, status, reason: res && res.reason, points: F.points, still };
+        return { quad: Q, status, reason: res && res.reason, points: F.mature, still };
       },
     };
   }
@@ -1071,7 +1121,118 @@ function setFrozen(v) {
   $('freezeBtn').textContent = v ? '📌 Fixado' : '📌 Fixar';
 }
 $('freezeBtn').onclick = () => setFrozen(!frozen);
-$('refindBtn').onclick = () => { tracker?.reset(); sm = null; orient = null; setFrozen(false); };
+$('refindBtn').onclick = () => { tracker?.reset(); sm = null; orient = null; calib = null; autoCalibDone = false; setFrozen(false); };
+
+/* ---------- Manual corners ----------
+   The user can drag 4 points onto the sheet's exact corners. They are stored in the tracked
+   sheet's own coordinates (UNIT square), so they stay glued to the paper as the camera moves. */
+const UNIT = [[0, 0], [1, 0], [1, 1], [0, 1]];
+let calib = null, calibrating = false, autoCalibDone = false, calibSnapQ = null;
+const handlesPos = [[0, 0], [0, 0], [0, 0], [0, 0]];
+function effQuad(q) {           // tracked sheet → the corners the user placed
+  if (!calib || !q) return q;
+  const Hs = PD.homography(UNIT, q); if (!Hs) return q;
+  return calib.map(c => FlowTrack.apply(Hs, c));
+}
+function fromScreen(pts) {      // screen coords → processing-canvas coords
+  const v = $('video'), W = v.clientWidth, H = v.clientHeight;
+  const vw = v.videoWidth, vh = v.videoHeight;
+  const s = Math.max(W / vw, H / vh), ox = (W - vw * s) / 2, oy = (H - vh * s) / 2;
+  const f = vw / proc.width;
+  return pts.map(([x, y]) => [(x - ox) / (f * s), (y - oy) / (f * s)]);
+}
+function openCalib() {
+  const v = $('video'); if (!v.videoWidth) return;
+  calibrating = true;
+  calibSnapQ = tracker && tracker.quad ? tracker.quad.map(p => p.slice()) : null;
+  // freeze the current camera picture, drawn exactly like the live view (object-fit: cover)
+  const c = $('calibCanvas'), W = $('ar').clientWidth, H = $('ar').clientHeight, dpr = window.devicePixelRatio || 1;
+  c.width = Math.round(W * dpr); c.height = Math.round(H * dpr);
+  const s = Math.max(W / v.videoWidth, H / v.videoHeight);
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.drawImage(v, (W - v.videoWidth * s) / 2, (H - v.videoHeight * s) / 2, v.videoWidth * s, v.videoHeight * s);
+  // start from the detected corners, or a centred rectangle if there's no sheet yet
+  const start = calibSnapQ ? toScreen(effQuad(calibSnapQ))
+    : [[W * 0.2, H * 0.2], [W * 0.8, H * 0.2], [W * 0.8, H * 0.75], [W * 0.2, H * 0.75]];
+  start.forEach((p, i) => { handlesPos[i][0] = p[0]; handlesPos[i][1] = p[1]; });
+  drawCalib();
+  $('calib').classList.remove('hidden');
+}
+function closeCalib() { calibrating = false; $('calib').classList.add('hidden'); $('loupe').classList.add('hidden'); }
+function drawCalib() {
+  document.querySelectorAll('#calib .handle').forEach((el, i) => {
+    el.style.transform = `translate(${handlesPos[i][0]}px, ${handlesPos[i][1]}px)`;
+  });
+  $('calibSvg').querySelector('polygon').setAttribute('points', handlesPos.map(p => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' '));
+}
+function drawLoupe(i) {
+  const L = $('loupe'), dpr = window.devicePixelRatio || 1, size = 132, zoom = 3;
+  L.width = size * dpr; L.height = size * dpr;
+  const [x, y] = handlesPos[i], W = $('ar').clientWidth;
+  // keep the magnifier away from the finger: above it, or below near the top of the screen
+  let lx = x - size / 2, ly = y - size - 70;
+  if (ly < 70) ly = y + 70;
+  lx = Math.max(6, Math.min(W - size - 6, lx));
+  L.style.left = lx + 'px'; L.style.top = ly + 'px';
+  const ctx = L.getContext('2d'), src = $('calibCanvas');
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, L.width, L.height);
+  const half = size / 2 / zoom;
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(src, (x - half) * dpr, (y - half) * dpr, half * 2 * dpr, half * 2 * dpr, 0, 0, L.width, L.height);
+  // the two sheet edges meeting at this corner, then a crosshair
+  ctx.save(); ctx.scale(dpr * zoom, dpr * zoom); ctx.translate(-(x - half), -(y - half));
+  ctx.strokeStyle = 'rgba(76,209,122,.9)'; ctx.lineWidth = 1.2 / zoom;
+  ctx.beginPath(); ctx.moveTo(...handlesPos[(i + 3) % 4]); ctx.lineTo(x, y); ctx.lineTo(...handlesPos[(i + 1) % 4]); ctx.stroke();
+  ctx.restore();
+  ctx.strokeStyle = '#d2552b'; ctx.lineWidth = 2 * dpr;
+  const m = L.width / 2;
+  ctx.beginPath(); ctx.moveTo(m - 14 * dpr, m); ctx.lineTo(m + 14 * dpr, m); ctx.moveTo(m, m - 14 * dpr); ctx.lineTo(m, m + 14 * dpr); ctx.stroke();
+  L.classList.remove('hidden');
+}
+document.querySelectorAll('#calib .handle').forEach(el => {
+  const i = +el.dataset.i; let start = null;
+  el.addEventListener('pointerdown', e => {
+    e.preventDefault(); el.setPointerCapture(e.pointerId); el.classList.add('active');
+    start = { x: e.clientX, y: e.clientY, hx: handlesPos[i][0], hy: handlesPos[i][1] };
+    drawLoupe(i);
+  });
+  el.addEventListener('pointermove', e => {
+    if (!start) return;
+    const W = $('ar').clientWidth, H = $('ar').clientHeight;
+    // relative drag: the point doesn't jump under the finger, so it stays visible
+    handlesPos[i][0] = Math.max(0, Math.min(W, start.hx + e.clientX - start.x));
+    handlesPos[i][1] = Math.max(0, Math.min(H, start.hy + e.clientY - start.y));
+    drawCalib(); drawLoupe(i);
+  });
+  const end = () => { start = null; el.classList.remove('active'); $('loupe').classList.add('hidden'); };
+  el.addEventListener('pointerup', end); el.addEventListener('pointercancel', end);
+});
+$('calibBtn').onclick = () => openCalib();
+$('calibCancel').onclick = closeCalib;
+$('calibOk').onclick = () => {
+  const P = fromScreen(handlesPos);
+  // must be a proper four-sided shape
+  let sign = 0, ok = true;
+  for (let i = 0; i < 4; i++) {
+    const a = P[i], b = P[(i + 1) % 4], c = P[(i + 2) % 4];
+    const cr = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+    if (!sign) sign = Math.sign(cr); else if (Math.sign(cr) !== sign) ok = false;
+  }
+  if (!ok) { $('calib').querySelector('.calibTop').textContent = 'Os pontos se cruzaram: arrume para formar um retângulo'; return; }
+  if (calibSnapQ) {
+    // express the user's corners in the tracked sheet's own coordinates (at the moment of the snapshot)
+    const Hi = FlowTrack.inv(PD.homography(UNIT, calibSnapQ));
+    calib = P.map(p => FlowTrack.apply(Hi, p));
+  } else {
+    // no automatic detection: the hand-placed corners become the sheet
+    const ordered = sign > 0 ? P : [P[0], P[3], P[2], P[1]];
+    tracker.setQuad(ordered); calib = null;
+  }
+  sm = null; orient = null;      // re-start smoothing and orientation from the new corners
+  $('calib').querySelector('.calibTop').textContent = 'Arraste os 4 pontos até os cantos exatos da folha';
+  closeCalib();
+};
 
 const STATUS = {
   searching: ['Procurando a folha…', ''],
@@ -1095,7 +1256,7 @@ async function startAR() {
   $('setup').classList.add('hidden'); $('ar').classList.remove('hidden');
   $('loading').classList.remove('hidden'); $('loading').textContent = 'Abrindo câmera…';
   settings = loadSettings(); buildSliders(); setFrozen(false);
-  sm = null; orient = null; lastStatus = '';
+  sm = null; orient = null; lastStatus = ''; calib = null; autoCalibDone = false; closeCalib();
   const ov = $('overlay'); ov.src = state.imageURL; ov.style.display = 'none';
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -1119,7 +1280,7 @@ async function startAR() {
   }
 }
 function stopAR() {
-  running = false;
+  running = false; closeCalib();
   stream?.getTracks().forEach(t => t.stop()); stream = null;
   $('video').srcObject = null;
   $('ar').classList.add('hidden'); $('setup').classList.remove('hidden');
@@ -1157,7 +1318,9 @@ function loop(now) {
     showStatus(st);
     edgeSince = st === 'edge' ? (edgeSince || now) : 0;
     if (out.quad) {
-      const target = toScreen(out.quad);
+      const target = toScreen(effQuad(out.quad));
+      // First time the sheet is identified: let the user confirm/fine-tune the 4 corners
+      if (!autoCalibDone && !calibrating && out.status === 'found') { autoCalibDone = true; openCalib(); }
       if (!sm) {
         sm = target.map(p => p.slice());
         // Decide portrait/landscape once: are the screen-horizontal edges (0-1, 2-3) the long ones?
